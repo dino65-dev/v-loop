@@ -91,16 +91,22 @@ class ContextEngine:
 
     def add_memory(self, result: RetrievalResult) -> None:
         record = result.record
+        conditions = "; ".join(f"{key}={value}" for key, value in sorted(record.conditions.items()))
         self.add(
             ContextItem(
                 source_id=record.memory_id,
                 kind="verified-memory",
-                content=record.claim,
+                content=f"{record.claim}\nApplicability: {conditions or 'none recorded'}",
                 trust=ContextTrust.VERIFIED_MEMORY,
                 metadata={
                     "ledger_event_hash": record.ledger_event_hash,
                     "source": result.source,
                     "score": f"{result.score:.6f}",
+                    "source_run_id": record.source_run_id,
+                    "confidence": f"{record.confidence:.6f}",
+                    "status": record.status,
+                    "expires_at": record.expires_at.isoformat() if record.expires_at else "",
+                    "supersedes": record.supersedes or "",
                 },
             )
         )
@@ -116,16 +122,20 @@ class ContextEngine:
         untrusted: list[ContextItem] = []
         truncated: list[str] = []
         remaining = self.maximum_chars
+        goal_tokens = set(contract.goal.lower().split())
         ordered = sorted(
             self._items,
             key=lambda item: (
                 item.trust is ContextTrust.UNTRUSTED,
-                item.captured_at,
+                -len(goal_tokens.intersection(set(item.content.lower().split()))),
+                -item.captured_at.timestamp(),
                 item.source_id,
             ),
         )
         for item in ordered:
-            cost = len(item.content)
+            # This is a conservative token approximation until the deployed
+            # tokenizer is provided by the model runtime. Metadata counts too.
+            cost = len(item.content) + sum(len(key) + len(value) for key, value in item.metadata.items())
             if cost > remaining:
                 truncated.append(item.source_id)
                 continue

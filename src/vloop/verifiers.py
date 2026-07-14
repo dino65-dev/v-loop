@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Callable, Iterable, Mapping, Protocol
 
-from .models import CheckResult, CheckStatus, ExecutionObservation, TaskContract, VerificationReport
+from .models import ActionIntent, CheckResult, CheckStatus, ExecutionObservation, TaskContract, VerificationReport
+from .receipts import EvaluationReceipt, ReceiptRejected, ReceiptVerifier
 
 
 class Verifier(Protocol):
@@ -15,6 +16,7 @@ class StructuralVerifier:
     """L0 schema validation before any semantic interpretation of evidence."""
 
     category = "evidence"
+    phase = 0
 
     def verify(self, contract: TaskContract, observation: ExecutionObservation) -> CheckResult:
         del contract
@@ -44,6 +46,8 @@ class StructuralVerifier:
 class ExecutionVerifier:
     """Hard check that an external tool actually completed successfully."""
 
+    phase = 2
+
     def verify(self, contract: TaskContract, observation: ExecutionObservation) -> CheckResult:
         return CheckResult(
             name="execution",
@@ -57,6 +61,7 @@ class IsolationEvidenceVerifier:
     """Hard policy check for the expected Firecracker isolation evidence."""
 
     category = "policy"
+    phase = 1
 
     def verify(self, contract: TaskContract, observation: ExecutionObservation) -> CheckResult:
         metadata = observation.metadata
@@ -86,6 +91,7 @@ class BenchmarkEvidenceVerifier:
     """Checks repeatable benchmark evidence without trusting a textual claim."""
 
     category = "quality"
+    phase = 3
 
     def __init__(
         self,
@@ -151,6 +157,7 @@ class DifferentialEvidenceVerifier:
     """
 
     category = "correctness"
+    phase = 2
 
     def verify(self, contract: TaskContract, observation: ExecutionObservation) -> CheckResult:
         del contract
@@ -185,6 +192,7 @@ class MetamorphicEvidenceVerifier:
     """L2 transformation-invariant receipt verifier."""
 
     category = "correctness"
+    phase = 2
 
     def verify(self, contract: TaskContract, observation: ExecutionObservation) -> CheckResult:
         del contract
@@ -217,6 +225,75 @@ class MetamorphicEvidenceVerifier:
         )
 
 
+class SignedReceiptVerifier:
+    """Authenticates an evaluator or supervisor receipt before trusting claims."""
+
+    phase = 1
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        category: str,
+        receipt_type: str,
+        receipt_verifier: ReceiptVerifier,
+    ) -> None:
+        if category not in {"correctness", "policy", "evidence", "quality"}:
+            raise ValueError("invalid receipt verifier category")
+        self.name = name
+        self.category = category
+        self.receipt_type = receipt_type
+        self.receipt_verifier = receipt_verifier
+
+    def verify_with_context(
+        self,
+        contract: TaskContract,
+        observation: ExecutionObservation,
+        *,
+        run_id: str | None,
+        intent: ActionIntent | None,
+    ) -> CheckResult:
+        del contract
+        if run_id is None or intent is None:
+            return CheckResult(self.name, CheckStatus.INCONCLUSIVE, {}, "missing verification binding")
+        receipts = observation.metadata.get("evaluator_receipts")
+        raw = receipts.get(self.receipt_type) if isinstance(receipts, Mapping) else None
+        if not isinstance(raw, Mapping):
+            return CheckResult(self.name, CheckStatus.INCONCLUSIVE, {}, "missing signed evaluator receipt")
+        try:
+            receipt = EvaluationReceipt.from_mapping(raw)
+            self.receipt_verifier.validate(
+                receipt,
+                receipt_type=self.receipt_type,
+                run_id=run_id,
+                intent_digest=intent.intent_digest,
+                artifact_digests=observation.artifact_digests,
+            )
+        except (KeyError, TypeError, ValueError, ReceiptRejected) as exc:
+            return CheckResult(
+                self.name,
+                CheckStatus.FAIL,
+                {"receipt_type": self.receipt_type, "error_type": type(exc).__name__},
+                "signed evaluator receipt was rejected",
+            )
+        status = {
+            "pass": CheckStatus.PASS,
+            "fail": CheckStatus.FAIL,
+            "inconclusive": CheckStatus.INCONCLUSIVE,
+        }[receipt.result]
+        return CheckResult(
+            self.name,
+            status,
+            {
+                "receipt_type": receipt.receipt_type,
+                "candidate_artifact_digest": receipt.candidate_artifact_digest,
+                "evaluator_image_digest": receipt.evaluator_image_digest,
+                "test_suite_digest": receipt.test_suite_digest,
+                "nonce": receipt.nonce,
+            },
+            "protected evaluator reported a failure" if status is CheckStatus.FAIL else "",
+        )
+
 class CallableVerifier:
     """Adapter for test, compiler, differential, policy, or quality checks."""
 
@@ -229,6 +306,7 @@ class CallableVerifier:
         if category not in {"correctness", "policy", "evidence", "quality"}:
             raise ValueError("invalid verifier category")
         self.name, self.category, self._check = name, category, check
+        self.phase = 2 if category in {"correctness", "policy", "evidence"} else 3
 
     def verify(self, contract: TaskContract, observation: ExecutionObservation) -> CheckResult:
         result = self._check(contract, observation)
@@ -246,7 +324,14 @@ class HybridVerifier:
     ) -> None:
         self._checks = tuple(checks)
 
-    def verify(self, contract: TaskContract, observation: ExecutionObservation) -> VerificationReport:
+    def verify(
+        self,
+        contract: TaskContract,
+        observation: ExecutionObservation,
+        *,
+        run_id: str | None = None,
+        intent: ActionIntent | None = None,
+    ) -> VerificationReport:
         results: list[CheckResult] = []
         categories: dict[str, list[CheckStatus]] = {
             "correctness": [],
@@ -254,10 +339,29 @@ class HybridVerifier:
             "evidence": [],
             "quality": [],
         }
-        for check in self._checks:
-            result = check.verify(contract, observation)
+        seen_names: set[str] = set()
+        for check in sorted(self._checks, key=lambda item: getattr(item, "phase", 2)):
+            try:
+                contextual = getattr(check, "verify_with_context", None)
+                result = (
+                    contextual(contract, observation, run_id=run_id, intent=intent)
+                    if callable(contextual)
+                    else check.verify(contract, observation)
+                )
+            except Exception as exc:
+                result = CheckResult(
+                    getattr(check, "name", type(check).__name__),
+                    CheckStatus.INCONCLUSIVE,
+                    {"error_type": type(exc).__name__},
+                    "verifier raised an exception",
+                )
+            if result.name in seen_names:
+                raise ValueError(f"duplicate verifier result name: {result.name}")
+            seen_names.add(result.name)
             results.append(result)
             categories[getattr(check, "category", "correctness")].append(result.status)
+            if getattr(check, "phase", 2) <= 1 and result.status is not CheckStatus.PASS:
+                break
 
         def reduce(statuses: list[CheckStatus]) -> CheckStatus:
             if not statuses:

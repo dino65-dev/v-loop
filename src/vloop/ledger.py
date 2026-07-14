@@ -21,8 +21,9 @@ class EvidenceLedger:
     def __init__(self, database: str | Path) -> None:
         self.path = Path(database)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self.path)
+        self._connection = sqlite3.connect(self.path, isolation_level=None)
         self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection.execute("PRAGMA busy_timeout=5000")
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS ledger_events (
@@ -35,24 +36,41 @@ class EvidenceLedger:
             )
             """
         )
-        self._connection.commit()
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ledger_head (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                event_hash TEXT NOT NULL
+            )
+            """
+        )
+        latest = self._connection.execute(
+            "SELECT event_hash FROM ledger_events ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        self._connection.execute(
+            "INSERT OR IGNORE INTO ledger_head (singleton, event_hash) VALUES (1, ?)",
+            (latest[0] if latest else "0" * 64,),
+        )
 
     def append(self, event_type: str, payload: Mapping[str, Any]) -> str:
         occurred_at = datetime.now(UTC).isoformat()
-        previous = self._connection.execute(
-            "SELECT event_hash FROM ledger_events ORDER BY sequence DESC LIMIT 1"
-        ).fetchone()
-        parent_hash = previous[0] if previous else "0" * 64
         serialized = canonical_json(payload)
-        event_hash = digest(
-            {
-                "event_type": event_type,
-                "occurred_at": occurred_at,
-                "payload": json.loads(serialized),
-                "parent_hash": parent_hash,
-            }
-        )
-        with self._connection:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            head = self._connection.execute(
+                "SELECT event_hash FROM ledger_head WHERE singleton = 1"
+            ).fetchone()
+            if head is None:  # pragma: no cover - schema invariant
+                raise RuntimeError("ledger head is missing")
+            parent_hash = head[0]
+            event_hash = digest(
+                {
+                    "event_type": event_type,
+                    "occurred_at": occurred_at,
+                    "payload": json.loads(serialized),
+                    "parent_hash": parent_hash,
+                }
+            )
             self._connection.execute(
                 """
                 INSERT INTO ledger_events
@@ -61,6 +79,16 @@ class EvidenceLedger:
                 """,
                 (event_type, occurred_at, serialized, parent_hash, event_hash),
             )
+            cursor = self._connection.execute(
+                "UPDATE ledger_head SET event_hash = ? WHERE singleton = 1 AND event_hash = ?",
+                (event_hash, parent_hash),
+            )
+            if cursor.rowcount != 1:  # pragma: no cover - BEGIN IMMEDIATE serializes writers
+                raise RuntimeError("ledger head changed during append")
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
         return event_hash
 
     def events(self) -> list[dict[str, Any]]:
@@ -115,7 +143,10 @@ class EvidenceLedger:
             if event["event_hash"] != expected:
                 return False
             parent_hash = event["event_hash"]
-        return True
+        head = self._connection.execute(
+            "SELECT event_hash FROM ledger_head WHERE singleton = 1"
+        ).fetchone()
+        return bool(head and head[0] == parent_hash)
 
     def close(self) -> None:
         self._connection.close()

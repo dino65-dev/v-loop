@@ -4,10 +4,12 @@ from dataclasses import replace
 from datetime import UTC, datetime
 import os
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from vloop.completion import RequiredChecksFinalVerifier
+from vloop.completion import EvidenceAccumulator, RequiredChecksFinalVerifier
+from vloop.authorization import CapabilityVerifier, InMemoryNonceStore
 from vloop.controller import VerifiedLoop
 from vloop.contract_compiler import (
     ContractCompilationError,
@@ -25,6 +27,7 @@ from vloop.delegation import (
     SpecialistTask,
 )
 from vloop.executor import BubblewrapExecutor
+from vloop.executor import CapabilityEnforcingExecutor, InMemoryIdempotencyStore
 from vloop.firecracker import (
     FirecrackerAssets,
     FirecrackerExecutor,
@@ -72,6 +75,7 @@ from vloop.neural_verifier import ShadowNeuralVerifier
 from vloop.neural_verifier import OpenAICompatibleDiagnosticBackend
 from vloop.policy import Approval, PolicyDenied, PolicyGate
 from vloop.probes import CallableProbe, ProbeDefinition, ProbeKind, ProtectedProbeRunner
+from vloop.receipts import ReceiptSigner, ReceiptVerifier
 from vloop.repair import RepairController
 from vloop.verifiers import (
     BenchmarkEvidenceVerifier,
@@ -81,6 +85,7 @@ from vloop.verifiers import (
     HybridVerifier,
     IsolationEvidenceVerifier,
     MetamorphicEvidenceVerifier,
+    SignedReceiptVerifier,
     StructuralVerifier,
 )
 
@@ -122,16 +127,18 @@ def test_policy_binds_capability_and_blocks_tainted_write() -> None:
     task = contract()
     gate = PolicyGate(task, signing_key=b"x" * 32)
     allowed = intent(task)
-    capability = gate.authorize(allowed)
+    capability = gate.authorize(allowed, executor_id="test-executor")
     gate.validate_and_consume(capability, allowed)
     with pytest.raises(PolicyDenied, match="already consumed"):
         gate.validate_and_consume(capability, allowed)
 
     tainted = intent(task, effect=Effect.WRITE, provenance=(Provenance.UNTRUSTED_RETRIEVAL,))
     with pytest.raises(PolicyDenied, match="tainted"):
-        gate.authorize(tainted)
+        gate.authorize(tainted, executor_id="test-executor")
     approval = Approval(tainted.intent_digest, "reviewer", datetime.now(UTC))
-    assert gate.authorize(tainted, [approval]).intent_digest == tainted.intent_digest
+    assert gate.authorize(
+        tainted, executor_id="test-executor", approvals=[approval]
+    ).intent_digest == tainted.intent_digest
 
 
 def test_policy_does_not_accept_sibling_or_traversal_targets() -> None:
@@ -148,7 +155,7 @@ def test_policy_does_not_accept_sibling_or_traversal_targets() -> None:
         contract_version=task.version,
     )
     with pytest.raises(PolicyDenied):
-        gate.authorize(sibling)
+        gate.authorize(sibling, executor_id="test-executor")
     with pytest.raises(ValueError, match="traversal"):
         ActionIntent(
             tool="command.run",
@@ -172,6 +179,22 @@ def test_ledger_hash_chain_detects_tampering(tmp_path: Path) -> None:
     assert not ledger.verify_chain()
 
 
+def test_ledger_serializes_concurrent_appenders(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.db"
+
+    def append(worker: int) -> None:
+        ledger = EvidenceLedger(path)
+        for sequence in range(10):
+            ledger.append("concurrent", {"worker": worker, "sequence": sequence})
+        ledger.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(append, (1, 2)))
+    ledger = EvidenceLedger(path)
+    assert len(ledger.events()) == 20
+    assert ledger.verify_chain()
+
+
 class Planner:
     def __init__(self, task: TaskContract) -> None:
         self.task = task
@@ -181,7 +204,10 @@ class Planner:
 
 
 class Executor:
-    def execute(self, action: ActionIntent) -> ExecutionObservation:
+    executor_id = "test-executor"
+
+    def execute(self, action: ActionIntent, capability) -> ExecutionObservation:
+        assert capability.executor_id == self.executor_id
         return ExecutionObservation(True, 0, "ok", "", {"binary": "hash"})
 
 
@@ -494,6 +520,26 @@ def test_contract_compiler_intersects_server_authority() -> None:
         )
 
 
+def test_contract_compiler_uses_most_restrictive_overlapping_authority() -> None:
+    compiler = TaskContractCompiler(
+        (
+            ToolAuthority("command.run", Effect.EXECUTE, ("/",), max_uses=10),
+            ToolAuthority(
+                "command.run", Effect.EXECUTE, ("/workspace",), approval_required=True, max_uses=2
+            ),
+        )
+    )
+    compiled = compiler.compile(
+        ContractRequest(
+            "bounded command",
+            ("command passes",),
+            (RequestedAction("command.run", Effect.EXECUTE, "/workspace/tests"),),
+        )
+    )
+    rule = compiled.allowed_actions[0]
+    assert rule.approval_required and rule.max_uses == 2
+
+
 def test_bazaarlink_deepseek_is_default_without_persisting_a_key() -> None:
     backend = OpenAICompatibleDiagnosticBackend(api_key="test-key")
     assert backend.base_url == "https://bazaarlink.ai/api/v1"
@@ -800,7 +846,7 @@ def test_policy_rejects_inline_secret_arguments() -> None:
         task.version,
     )
     with pytest.raises(PolicyDenied, match="inline secrets"):
-        PolicyGate(task, signing_key=b"s" * 32).authorize(leaky)
+        PolicyGate(task, signing_key=b"s" * 32).authorize(leaky, executor_id="test-executor")
 
 
 class CountingSpecialist:
@@ -881,3 +927,216 @@ def test_firecracker_supervisor_preflight_fails_closed_and_plan_is_shell_free(tm
     assert plan.jailer_argv[0] == str(runtime.jailer_binary)
     assert "--" in plan.jailer_argv
     assert plan.manifest_digest == launch.manifest_digest
+
+
+class CountingRawExecutor:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def execute(self, action: ActionIntent) -> ExecutionObservation:
+        self.calls += 1
+        return ExecutionObservation(True, 0, "raw", "", {"result": "artifact-hash"})
+
+
+def test_executor_enforces_public_key_capability_and_idempotency() -> None:
+    task = replace(
+        contract(),
+        allowed_actions=(
+            ActionRule("command.run", Effect.EXECUTE, "/workspace", max_uses=3),
+            ActionRule("file.write", Effect.WRITE, "/workspace", approval_required=True),
+        ),
+    )
+    gate = PolicyGate(task, signing_key=b"a" * 32)
+    raw = CountingRawExecutor()
+    executor = CapabilityEnforcingExecutor(
+        executor_id="test-enforcer",
+        raw_executor=raw,
+        capability_verifier=CapabilityVerifier(gate.capability_public_key, InMemoryNonceStore()),
+        idempotency_store=InMemoryIdempotencyStore(),
+    )
+    action = intent(task)
+    first_capability = gate.authorize(action, executor_id="test-enforcer")
+    assert executor.execute(action, first_capability).success
+    assert raw.calls == 1
+
+    replay_capability = gate.authorize(action, executor_id="test-enforcer")
+    replay = executor.execute(action, replay_capability)
+    assert replay.success and replay.metadata["idempotency_replay"]
+    assert raw.calls == 1
+
+    wrong_audience = gate.authorize(action, executor_id="another-enforcer")
+    denied = executor.execute(action, wrong_audience)
+    assert not denied.success
+    assert denied.metadata["capability_verified"] is False
+
+
+def test_signed_receipt_binds_evaluator_claim_to_run_intent_and_artifact() -> None:
+    task = contract()
+    action = intent(task)
+    signer = ReceiptSigner(b"r" * 32)
+    receipt = signer.issue(
+        receipt_type="differential",
+        run_id="run-1",
+        intent_digest=action.intent_digest,
+        candidate_artifact_digest="artifact-hash",
+        evaluator_image_digest="evaluator-image",
+        test_suite_digest="suite-digest",
+        result="pass",
+    )
+    observation = ExecutionObservation(
+        True,
+        0,
+        "",
+        "",
+        {"result": "artifact-hash"},
+        {"evaluator_receipts": {"differential": receipt.as_mapping()}},
+    )
+    verifier = HybridVerifier(
+        [
+            SignedReceiptVerifier(
+                name="signed-differential",
+                category="correctness",
+                receipt_type="differential",
+                receipt_verifier=ReceiptVerifier(signer.public_key_bytes),
+            )
+        ]
+    )
+    assert verifier.verify(task, observation, run_id="run-1", intent=action).accepted
+    mismatched = replace(observation, artifact_digests={"result": "other-artifact"})
+    assert verifier.verify(task, mismatched, run_id="run-1", intent=action).correctness is CheckStatus.FAIL
+
+
+def test_final_verifier_uses_only_receipts_fresh_for_final_source_state() -> None:
+    task = TaskContract(
+        "build and test",
+        ("build and tests pass",),
+        (ActionRule("command.run", Effect.EXECUTE, "/workspace"),),
+    )
+    action = intent(task)
+    accumulator = EvidenceAccumulator("run-1")
+    compile_report = VerificationReport(
+        CheckStatus.PASS,
+        CheckStatus.PASS,
+        CheckStatus.PASS,
+        CheckStatus.PASS,
+        (CheckResult("compile", CheckStatus.PASS, {}),),
+    )
+    test_report = VerificationReport(
+        CheckStatus.PASS,
+        CheckStatus.PASS,
+        CheckStatus.PASS,
+        CheckStatus.PASS,
+        (CheckResult("tests", CheckStatus.PASS, {}),),
+    )
+    accumulator.append(
+        intent=action,
+        observation=ExecutionObservation(True, 0, "", "", {}, {"source_state_digest": "source-a"}),
+        report=compile_report,
+    )
+    accumulator.append(
+        intent=action,
+        observation=ExecutionObservation(True, 0, "", "", {}, {"source_state_digest": "source-b"}),
+        report=test_report,
+    )
+    final = RequiredChecksFinalVerifier({"build and tests pass": ("compile", "tests")})
+    assert (
+        final.verify(
+            contract=task,
+            action_report=test_report,
+            history=(),
+            evidence=accumulator.snapshot(),
+        ).status
+        is CheckStatus.FAIL
+    )
+    accumulator.append(
+        intent=action,
+        observation=ExecutionObservation(True, 0, "", "", {}, {"source_state_digest": "source-b"}),
+        report=compile_report,
+    )
+    assert (
+        final.verify(
+            contract=task,
+            action_report=compile_report,
+            history=(),
+            evidence=accumulator.snapshot(),
+        ).status
+        is CheckStatus.PASS
+    )
+
+
+def test_successful_action_cannot_bypass_registered_adversarial_probe(tmp_path: Path) -> None:
+    task = contract()
+    probe_runner = ProtectedProbeRunner(
+        [
+            CallableProbe(
+                ProbeDefinition("held-out", ProbeKind.COUNTEREXAMPLE, "run held-out case"),
+                lambda *_args: CheckResult("probe:held-out", CheckStatus.FAIL, {"case": "hidden"}),
+            )
+        ]
+    )
+    quality = CallableVerifier(
+        "benchmark", "quality", lambda *_args: CheckResult("benchmark", CheckStatus.PASS, {})
+    )
+    evidence = CallableVerifier(
+        "evidence", "evidence", lambda *_args: CheckResult("evidence", CheckStatus.PASS, {})
+    )
+    ledger = EvidenceLedger(tmp_path / "ledger.db")
+    loop = VerifiedLoop(
+        contract=replace(task, maximum_iterations=1),
+        planner=Planner(task),
+        gate=PolicyGate(task, signing_key=b"u" * 32),
+        executor=Executor(),
+        verifier=HybridVerifier([ExecutionVerifier(), quality, evidence]),
+        ledger=ledger,
+        final_verifier=final_verifier(),
+        probe_runner=probe_runner,
+    )
+    assert loop.run() is LoopDecision.STOP
+    assert any(event["event_type"] == "probe.completed" for event in ledger.events())
+
+
+class SignedFirecrackerSupervisor:
+    def __init__(self, signer: ReceiptSigner) -> None:
+        self.signer = signer
+
+    def run(self, launch):
+        artifacts = {"result": "result-sha"}
+        receipt = self.signer.issue(
+            receipt_type="firecracker-supervisor",
+            run_id=launch.manifest["run_id"],
+            intent_digest=launch.manifest["intent_digest"],
+            candidate_artifact_digest="result-sha",
+            evaluator_image_digest="supervisor-image",
+            test_suite_digest="guest-policy",
+            result="pass",
+            claims={
+                "job_id": launch.job_id,
+                "manifest_digest": launch.manifest_digest,
+                "fresh_job_drive": True,
+                "job_drive_destroyed": True,
+            },
+        )
+        return GuestExecutionResult(
+            launch.manifest_digest,
+            True,
+            0,
+            "guest finished",
+            "",
+            artifacts,
+            "/job/vloop-result.json",
+            receipt.as_mapping(),
+        )
+
+
+def test_firecracker_requires_supervisor_signed_lifecycle_receipt(tmp_path: Path) -> None:
+    kernel, rootfs, drive = (tmp_path / "vmlinux", tmp_path / "rootfs.ext4", tmp_path / "job.ext4")
+    for asset in (kernel, rootfs, drive):
+        asset.write_bytes(b"asset")
+    signer = ReceiptSigner(b"f" * 32)
+    executor = FirecrackerExecutor(
+        FirecrackerJobBuilder(FirecrackerAssets(kernel, rootfs, drive)),
+        SignedFirecrackerSupervisor(signer),
+        ReceiptVerifier(signer.public_key_bytes),
+    )
+    executor.bind_run("run-firecracker")
+    assert executor.execute(intent(contract())).success

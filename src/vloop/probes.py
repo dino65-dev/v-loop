@@ -97,6 +97,7 @@ class ProtectedProbeRunner:
         intent: ActionIntent,
         observation: ExecutionObservation,
         hard_report: VerificationReport,
+        force: bool = False,
     ) -> ProbeReport:
         categories = {
             "correctness": hard_report.correctness,
@@ -107,7 +108,8 @@ class ProtectedProbeRunner:
         selected = [
             probe
             for probe in self._probes
-            if any(categories[category] is not CheckStatus.PASS for category in probe.definition.trigger_categories)
+            if force
+            or any(categories[category] is not CheckStatus.PASS for category in probe.definition.trigger_categories)
         ]
         results: list[CheckResult] = []
         for probe in selected:

@@ -245,8 +245,6 @@ class MemoryRouter:
     def select(self, query: MemoryQuery, *, associative_available: bool) -> tuple[str, ...]:
         if associative_available and (query.historical or query.associative) and not query.latency_sensitive:
             return ("hot", "associative")
-        if associative_available and (query.historical or query.associative):
-            return ("hot", "associative")
         return ("hot",)
 
 

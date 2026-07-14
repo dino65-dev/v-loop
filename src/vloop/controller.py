@@ -8,7 +8,7 @@ from typing import Iterable, Protocol
 from uuid import uuid4
 
 from .canonical import digest
-from .completion import FinalVerifier
+from .completion import EvidenceAccumulator, FinalVerifier
 from .context import ContextPackage
 from .executor import Executor
 from .ledger import EvidenceLedger
@@ -84,6 +84,7 @@ class VerifiedLoop:
         self.memory_committer = memory_committer
         self.memory_candidate_producer = memory_candidate_producer
         self.run_id = str(uuid4())
+        self._evidence = EvidenceAccumulator(self.run_id)
         self._history: list[dict] = []
         self._seen_failures: set[tuple[str, str]] = set()
         self._tool_calls = 0
@@ -110,8 +111,11 @@ class VerifiedLoop:
                 },
             )
             try:
-                capability = self.gate.authorize(intent, approvals)
-                self.gate.validate_and_consume(capability, intent)
+                capability = self.gate.authorize(
+                    intent,
+                    executor_id=self.executor.executor_id,
+                    approvals=approvals,
+                )
             except PolicyDenied as exc:
                 self._history.append({"intent": intent.intent_digest, "failure": str(exc)})
                 self.ledger.append(
@@ -121,19 +125,56 @@ class VerifiedLoop:
                 return self._terminal(LoopDecision.ESCALATE, "policy-denied")
 
             self._tool_calls += 1
-            observation = self.executor.execute(intent)
+            binder = getattr(self.executor, "bind_run", None)
+            if callable(binder):
+                binder(self.run_id)
+            observation = self.executor.execute(intent, capability)
             execution_event_hash = self.ledger.append(
                 "execution.observed",
                 {
                     "run_id": self.run_id,
                     "intent_digest": intent.intent_digest,
+                    "capability_id": capability.capability_id,
+                    "executor_id": capability.executor_id,
                     "success": observation.success,
                     "exit_code": observation.exit_code,
                     "artifact_digests": dict(observation.artifact_digests),
                     "metadata": dict(observation.metadata),
                 },
             )
-            report = self.verifier.verify(self.contract, observation)
+            try:
+                report = self.verifier.verify(
+                    self.contract,
+                    observation,
+                    run_id=self.run_id,
+                    intent=intent,
+                )
+            except Exception as exc:
+                report = VerificationReport(
+                    CheckStatus.INCONCLUSIVE,
+                    CheckStatus.INCONCLUSIVE,
+                    CheckStatus.INCONCLUSIVE,
+                    CheckStatus.INCONCLUSIVE,
+                    (
+                        CheckResult(
+                            "verification-runtime",
+                            CheckStatus.INCONCLUSIVE,
+                            {"error_type": type(exc).__name__},
+                            "verification runtime failed closed",
+                        ),
+                    ),
+                )
+            if report.accepted and self.probe_runner is not None:
+                preaccept_probes = self._run_probes(
+                    intent,
+                    observation,
+                    report,
+                    "pre-accept",
+                    force=True,
+                )
+                if preaccept_probes is not None:
+                    report = self._merge_probe_report(report, preaccept_probes)
+            self._evidence.append(intent=intent, observation=observation, report=report)
             verification_event_hash = self.ledger.append(
                 "verification.completed",
                 {
@@ -303,6 +344,7 @@ class VerifiedLoop:
                     contract=self.contract,
                     action_report=report,
                     history=tuple(self._history),
+                    evidence=self._evidence.snapshot(),
                 )
             except Exception as exc:
                 result = CheckResult(
@@ -387,14 +429,17 @@ class VerifiedLoop:
         observation: ExecutionObservation,
         report: VerificationReport,
         stage: str,
+        *,
+        force: bool = False,
     ) -> ProbeReport | None:
-        if stage != "probe" or self.probe_runner is None:
+        if stage not in {"probe", "pre-accept"} or self.probe_runner is None:
             return None
         probe_report = self.probe_runner.run(
             contract=self.contract,
             intent=intent,
             observation=observation,
             hard_report=report,
+            force=force,
         )
         self.ledger.append(
             "probe.completed",
@@ -413,6 +458,21 @@ class VerifiedLoop:
             },
         )
         return probe_report
+
+    @staticmethod
+    def _merge_probe_report(report: VerificationReport, probes: ProbeReport) -> VerificationReport:
+        evidence = report.evidence
+        if probes.status is CheckStatus.FAIL:
+            evidence = CheckStatus.FAIL
+        elif probes.status is CheckStatus.INCONCLUSIVE and evidence is CheckStatus.PASS:
+            evidence = CheckStatus.INCONCLUSIVE
+        return VerificationReport(
+            report.correctness,
+            report.policy,
+            evidence,
+            report.quality,
+            (*report.checks, *probes.results),
+        )
 
     @staticmethod
     def _failure_signature(intent: ActionIntent) -> str:

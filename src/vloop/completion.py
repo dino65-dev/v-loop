@@ -12,7 +12,64 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Mapping, Protocol
 
-from .models import CheckResult, CheckStatus, TaskContract, VerificationReport
+from .models import (
+    ActionIntent,
+    CheckResult,
+    CheckStatus,
+    ExecutionObservation,
+    TaskContract,
+    VerificationReport,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ActionEvidence:
+    """Immutable verification outcome for one completed action."""
+
+    sequence: int
+    intent_digest: str
+    artifact_digests: Mapping[str, str]
+    source_state_digest: str | None
+    report: VerificationReport
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceSnapshot:
+    run_id: str
+    actions: tuple[ActionEvidence, ...]
+
+    @property
+    def final_source_state_digest(self) -> str | None:
+        return self.actions[-1].source_state_digest if self.actions else None
+
+
+class EvidenceAccumulator:
+    """Run-local evidence index used by final-state verification."""
+
+    def __init__(self, run_id: str) -> None:
+        self._run_id = run_id
+        self._actions: list[ActionEvidence] = []
+
+    def append(
+        self,
+        *,
+        intent: ActionIntent,
+        observation: ExecutionObservation,
+        report: VerificationReport,
+    ) -> None:
+        source_digest = observation.metadata.get("source_state_digest")
+        self._actions.append(
+            ActionEvidence(
+                sequence=len(self._actions) + 1,
+                intent_digest=intent.intent_digest,
+                artifact_digests=dict(observation.artifact_digests),
+                source_state_digest=source_digest if isinstance(source_digest, str) and source_digest else None,
+                report=report,
+            )
+        )
+
+    def snapshot(self) -> EvidenceSnapshot:
+        return EvidenceSnapshot(self._run_id, tuple(self._actions))
 
 
 class FinalVerifier(Protocol):
@@ -24,6 +81,7 @@ class FinalVerifier(Protocol):
         contract: TaskContract,
         action_report: VerificationReport,
         history: tuple[dict, ...],
+        evidence: EvidenceSnapshot,
     ) -> CheckResult: ...
 
 
@@ -45,9 +103,10 @@ class RequiredChecksFinalVerifier:
         contract: TaskContract,
         action_report: VerificationReport,
         history: tuple[dict, ...],
+        evidence: EvidenceSnapshot,
     ) -> CheckResult:
-        del history  # The condition/check binding, not planner text, is authoritative.
-        check_statuses = {check.name: check.status for check in action_report.checks}
+        del history, action_report  # Bound receipts, not planner text, are authoritative.
+        check_statuses = self._fresh_check_statuses(evidence)
         missing_bindings = [
             condition
             for condition in contract.success_conditions
@@ -61,7 +120,7 @@ class RequiredChecksFinalVerifier:
             if any(status != CheckStatus.PASS.value for status in statuses.values()):
                 failed_conditions[condition] = statuses
 
-        evidence = {
+        payload = {
             "contract_digest": contract.contract_digest,
             "required_checks": self._required_checks,
             "missing_bindings": tuple(missing_bindings),
@@ -72,17 +131,39 @@ class RequiredChecksFinalVerifier:
             return CheckResult(
                 "final-goal",
                 CheckStatus.INCONCLUSIVE,
-                evidence,
+                payload,
                 "each success condition needs an explicit protected check binding",
             )
-        if not action_report.accepted or failed_conditions:
+        if not evidence.actions or failed_conditions:
             return CheckResult(
                 "final-goal",
                 CheckStatus.FAIL,
-                evidence,
+                payload,
                 "a bound final check did not pass",
             )
-        return CheckResult("final-goal", CheckStatus.PASS, evidence)
+        return CheckResult("final-goal", CheckStatus.PASS, payload)
+
+    @staticmethod
+    def _fresh_check_statuses(evidence: EvidenceSnapshot) -> dict[str, CheckStatus]:
+        if not evidence.actions:
+            return {}
+        final_source = evidence.final_source_state_digest
+        relevant = (
+            [action for action in evidence.actions if action.source_state_digest == final_source]
+            if final_source is not None
+            else [evidence.actions[-1]]
+        )
+        statuses: dict[str, CheckStatus] = {}
+        for action in relevant:
+            for check in action.report.checks:
+                existing = statuses.get(check.name)
+                if existing is CheckStatus.FAIL or check.status is CheckStatus.FAIL:
+                    statuses[check.name] = CheckStatus.FAIL
+                elif existing is CheckStatus.INCONCLUSIVE or check.status is CheckStatus.INCONCLUSIVE:
+                    statuses[check.name] = CheckStatus.INCONCLUSIVE
+                else:
+                    statuses[check.name] = CheckStatus.PASS
+        return statuses
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +175,7 @@ class CallableFinalVerifier:
     suitable inputs here.
     """
 
-    check: Callable[[TaskContract, VerificationReport, tuple[dict, ...]], CheckResult]
+    check: Callable[[TaskContract, VerificationReport, tuple[dict, ...], EvidenceSnapshot], CheckResult]
 
     def verify(
         self,
@@ -102,8 +183,9 @@ class CallableFinalVerifier:
         contract: TaskContract,
         action_report: VerificationReport,
         history: tuple[dict, ...],
+        evidence: EvidenceSnapshot,
     ) -> CheckResult:
-        result = self.check(contract, action_report, history)
+        result = self.check(contract, action_report, history, evidence)
         if result.name != "final-goal":
             raise ValueError("final verifier must return a final-goal check")
         return result

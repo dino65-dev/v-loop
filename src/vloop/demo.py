@@ -5,8 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from .authorization import CapabilityVerifier, InMemoryNonceStore
 from .completion import RequiredChecksFinalVerifier
 from .controller import VerifiedLoop
+from .executor import CapabilityEnforcingExecutor, InMemoryIdempotencyStore
 from .ledger import EvidenceLedger
 from .models import (
     ActionIntent,
@@ -36,7 +38,7 @@ class DemoPlanner:
         )
 
 
-class DemoExecutor:
+class DemoRawExecutor:
     def execute(self, intent: ActionIntent) -> ExecutionObservation:
         return ExecutionObservation(True, 0, "checked", "", {"result": "demo"})
 
@@ -54,11 +56,17 @@ def main() -> None:
     )
     with TemporaryDirectory() as directory:
         ledger = EvidenceLedger(Path(directory) / "ledger.db")
+        gate = PolicyGate(contract, signing_key=b"d" * 32)
         loop = VerifiedLoop(
             contract=contract,
             planner=DemoPlanner(),
-            gate=PolicyGate(contract, signing_key=b"d" * 32),
-            executor=DemoExecutor(),
+            gate=gate,
+            executor=CapabilityEnforcingExecutor(
+                executor_id="demo-executor",
+                raw_executor=DemoRawExecutor(),
+                capability_verifier=CapabilityVerifier(gate.capability_public_key, InMemoryNonceStore()),
+                idempotency_store=InMemoryIdempotencyStore(),
+            ),
             verifier=HybridVerifier([ExecutionVerifier(), quality]),
             ledger=ledger,
             final_verifier=RequiredChecksFinalVerifier(

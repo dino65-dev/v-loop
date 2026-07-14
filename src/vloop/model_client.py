@@ -10,6 +10,7 @@ import json
 import os
 from typing import Any
 
+from .context import ContextPackage
 from .models import ActionIntent, Effect, Provenance, TaskContract
 
 
@@ -33,6 +34,26 @@ class OpenAICompatiblePlanner:
             )
 
     def propose(self, *, contract: TaskContract, history: tuple[dict, ...]) -> ActionIntent:
+        return self._propose(contract=contract, history=history, context=None)
+
+    def propose_with_context(
+        self,
+        *,
+        contract: TaskContract,
+        history: tuple[dict, ...],
+        context: ContextPackage,
+    ) -> ActionIntent:
+        if context.contract_digest != contract.contract_digest:
+            raise ValueError("context package belongs to another contract")
+        return self._propose(contract=contract, history=history, context=context)
+
+    def _propose(
+        self,
+        *,
+        contract: TaskContract,
+        history: tuple[dict, ...],
+        context: ContextPackage | None,
+    ) -> ActionIntent:
         try:
             from openai import OpenAI
         except ImportError as exc:  # pragma: no cover
@@ -43,7 +64,6 @@ class OpenAICompatiblePlanner:
             "effect": "read|write|execute|network|delete|publish",
             "target": "absolute target within contract",
             "arguments": "object",
-            "provenance": ["user|trusted-repository|untrusted-retrieval|tool-output|verified-memory"],
             "explanation": "short evidence-grounded reason",
         }
         completion = client.chat.completions.create(
@@ -73,6 +93,7 @@ class OpenAICompatiblePlanner:
                                 for rule in contract.allowed_actions
                             ],
                             "history": history[-8:],
+                            "context": self._context_payload(context),
                         }
                     ),
                 },
@@ -90,8 +111,43 @@ class OpenAICompatiblePlanner:
             effect=Effect(str(data["effect"])),
             target=str(data["target"]),
             arguments=dict(data.get("arguments", {})),
-            provenance=tuple(Provenance(value) for value in data["provenance"]),
+            # The model cannot self-attest provenance.  The controller derives
+            # provenance from the context package and policy-owned sources.
+            provenance=(Provenance.USER,),
             explanation=str(data["explanation"]),
             contract_id=contract.contract_id,
             contract_version=contract.version,
         )
+
+    @staticmethod
+    def _context_payload(context: ContextPackage | None) -> dict[str, Any]:
+        if context is None:
+            return {"trusted": [], "untrusted": [], "working_state": None}
+
+        def encode(item) -> dict[str, Any]:
+            return {
+                "source_id": item.source_id,
+                "kind": item.kind,
+                "content": item.content,
+                "metadata": dict(item.metadata),
+                "content_digest": item.content_digest,
+            }
+
+        return {
+            "environment_digest": context.environment_digest,
+            "trusted": [encode(item) for item in context.trusted_items],
+            "untrusted": [encode(item) for item in context.untrusted_items],
+            "working_state": (
+                {
+                    "task_id": context.working_state.task_id,
+                    "project_scope": context.working_state.project_scope,
+                    "current_step": context.working_state.current_step,
+                    "hypotheses": context.working_state.hypotheses,
+                    "observations": context.working_state.observations,
+                    "updated_at": context.working_state.updated_at.isoformat(),
+                }
+                if context.working_state
+                else None
+            ),
+            "truncated_source_ids": context.truncated_source_ids,
+        }

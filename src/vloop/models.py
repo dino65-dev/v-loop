@@ -115,8 +115,11 @@ class ActionIntent:
 @dataclass(frozen=True, slots=True)
 class Capability:
     capability_id: str
+    nonce: str
     intent_digest: str
     contract_digest: str
+    executor_id: str
+    issued_at: datetime
     expires_at: datetime
     signature: str
 

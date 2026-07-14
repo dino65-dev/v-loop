@@ -56,14 +56,14 @@ class TaskContractCompiler:
             raise ContractCompilationError("at least one success condition is required")
         rules: list[ActionRule] = []
         for action in request.requested_actions:
-            authority = self._resolve(action)
+            authorities = self._resolve_all(action)
             rules.append(
                 ActionRule(
                     tool=action.tool,
                     effect=action.effect,
                     target_prefix=action.target_prefix,
-                    approval_required=authority.approval_required,
-                    max_uses=authority.max_uses,
+                    approval_required=any(authority.approval_required for authority in authorities),
+                    max_uses=self._minimum_max_uses(authorities),
                 )
             )
         if not rules:
@@ -77,7 +77,7 @@ class TaskContractCompiler:
             maximum_tool_calls=request.maximum_tool_calls,
         )
 
-    def _resolve(self, action: RequestedAction) -> ToolAuthority:
+    def _resolve_all(self, action: RequestedAction) -> tuple[ToolAuthority, ...]:
         matches = [
             authority
             for authority in self._catalog
@@ -89,7 +89,12 @@ class TaskContractCompiler:
             raise ContractCompilationError(
                 f"requested action is outside server authority: {action.tool} {action.effect.value}"
             )
-        return matches[0]
+        return tuple(matches)
+
+    @staticmethod
+    def _minimum_max_uses(authorities: tuple[ToolAuthority, ...]) -> int | None:
+        limits = [authority.max_uses for authority in authorities if authority.max_uses is not None]
+        return min(limits) if limits else None
 
     @staticmethod
     def _is_within(requested_prefix: str, permitted_prefix: str) -> bool:

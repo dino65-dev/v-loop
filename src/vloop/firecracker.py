@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from .canonical import digest
 from .models import ActionIntent, Effect, ExecutionObservation
+from .receipts import EvaluationReceipt, ReceiptRejected, ReceiptVerifier
 
 
 class FirecrackerConfigurationError(ValueError):
@@ -213,6 +214,7 @@ class GuestExecutionResult:
     stderr: str
     artifact_digests: Mapping[str, str]
     result_path: str
+    supervisor_receipt: Mapping[str, Any] | None = None
 
 
 class FirecrackerJobBuilder:
@@ -223,7 +225,7 @@ class FirecrackerJobBuilder:
         self.assets = assets
         self.resources = resources
 
-    def build(self, intent: ActionIntent) -> FirecrackerLaunch:
+    def build(self, intent: ActionIntent, *, run_id: str = "unbound") -> FirecrackerLaunch:
         if intent.tool != "command.run" or intent.effect is not Effect.EXECUTE:
             raise FirecrackerConfigurationError("Firecracker only executes command.run intents")
         command = intent.arguments.get("command")
@@ -242,6 +244,7 @@ class FirecrackerJobBuilder:
         manifest = {
             "schema_version": 1,
             "job_id": job_id,
+            "run_id": run_id,
             "intent_digest": intent.intent_digest,
             "argv": command,
             "working_directory": "/workspace",
@@ -287,13 +290,23 @@ class FirecrackerJobBuilder:
 class FirecrackerExecutor:
     """Executor adapter requiring a separately deployed privileged supervisor."""
 
-    def __init__(self, builder: FirecrackerJobBuilder, supervisor: FirecrackerSupervisor) -> None:
+    def __init__(
+        self,
+        builder: FirecrackerJobBuilder,
+        supervisor: FirecrackerSupervisor,
+        supervisor_receipt_verifier: ReceiptVerifier | None = None,
+    ) -> None:
         self._builder = builder
         self._supervisor = supervisor
+        self._supervisor_receipt_verifier = supervisor_receipt_verifier
+        self._run_id: str | None = None
+
+    def bind_run(self, run_id: str) -> None:
+        self._run_id = run_id
 
     def execute(self, intent: ActionIntent) -> ExecutionObservation:
         try:
-            launch = self._builder.build(intent)
+            launch = self._builder.build(intent, run_id=self._run_id or "unbound")
         except FirecrackerConfigurationError as exc:
             return ExecutionObservation(False, None, "", str(exc), metadata={"executor": "firecracker"})
         result = self._supervisor.run(launch)
@@ -310,6 +323,19 @@ class FirecrackerExecutor:
                     "config_digest": launch.config_digest,
                 },
             )
+        receipt_metadata: dict[str, Any] = {}
+        if self._supervisor_receipt_verifier is not None:
+            receipt_error = self._validate_supervisor_receipt(launch, intent, result)
+            if receipt_error is not None:
+                return ExecutionObservation(
+                    False,
+                    result.exit_code,
+                    result.stdout[-16_384:],
+                    receipt_error,
+                    artifact_digests=dict(result.artifact_digests),
+                    metadata={"executor": "firecracker", "isolation": "microvm"},
+                )
+            receipt_metadata = {"evaluator_receipts": {"firecracker-supervisor": result.supervisor_receipt}}
         return ExecutionObservation(
             success=result.success,
             exit_code=result.exit_code,
@@ -325,5 +351,35 @@ class FirecrackerExecutor:
                 "guest_result_path": result.result_path,
                 "rootfs_read_only": True,
                 "network_enabled": False,
+                **receipt_metadata,
             },
         )
+
+    def _validate_supervisor_receipt(
+        self,
+        launch: FirecrackerLaunch,
+        intent: ActionIntent,
+        result: GuestExecutionResult,
+    ) -> str | None:
+        if self._run_id is None or result.supervisor_receipt is None:
+            return "missing supervisor-signed execution receipt"
+        try:
+            receipt = EvaluationReceipt.from_mapping(result.supervisor_receipt)
+            self._supervisor_receipt_verifier.validate(
+                receipt,
+                receipt_type="firecracker-supervisor",
+                run_id=self._run_id,
+                intent_digest=intent.intent_digest,
+                artifact_digests=result.artifact_digests,
+            )
+        except (KeyError, TypeError, ValueError, ReceiptRejected):
+            return "supervisor-signed execution receipt was rejected"
+        claims = receipt.claims
+        if (
+            claims.get("job_id") != launch.job_id
+            or claims.get("manifest_digest") != launch.manifest_digest
+            or claims.get("fresh_job_drive") is not True
+            or claims.get("job_drive_destroyed") is not True
+        ):
+            return "supervisor receipt lacks required job lifecycle attestations"
+        return None
