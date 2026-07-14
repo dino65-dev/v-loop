@@ -13,6 +13,7 @@ KVM access and, in production, its jailer execution environment.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 from uuid import uuid4
@@ -29,6 +30,134 @@ class FirecrackerSupervisor(Protocol):
     """Privileged service that owns KVM, jailer, drives, and VM lifecycle."""
 
     def run(self, launch: "FirecrackerLaunch") -> "GuestExecutionResult": ...
+
+
+@dataclass(frozen=True, slots=True)
+class FirecrackerRuntime:
+    """Deployment-owned paths required by a privileged supervisor."""
+
+    firecracker_binary: Path
+    jailer_binary: Path
+    chroot_base: Path
+    kvm_device: Path = Path("/dev/kvm")
+
+    def __post_init__(self) -> None:
+        for label, path in (
+            ("Firecracker binary", self.firecracker_binary),
+            ("jailer binary", self.jailer_binary),
+            ("jailer chroot base", self.chroot_base),
+            ("KVM device", self.kvm_device),
+        ):
+            if not path.is_absolute():
+                raise FirecrackerConfigurationError(f"{label} must be an absolute path")
+
+
+@dataclass(frozen=True, slots=True)
+class FirecrackerPreflightReport:
+    ready: bool
+    checks: Mapping[str, str]
+
+    def require_ready(self) -> None:
+        if not self.ready:
+            failed = ", ".join(name for name, status in self.checks.items() if status != "ready")
+            raise FirecrackerConfigurationError(f"Firecracker supervisor preflight failed: {failed}")
+
+
+class FirecrackerPreflight:
+    """Fail-closed host prerequisite validation for a Firecracker supervisor.
+
+    This checks only deployer-owned files and KVM access.  It neither starts a
+    VM nor grants the controller permission to operate Firecracker directly.
+    """
+
+    @staticmethod
+    def check(runtime: FirecrackerRuntime, assets: "FirecrackerAssets") -> FirecrackerPreflightReport:
+        checks: dict[str, str] = {}
+        for label, path in (
+            ("firecracker_binary", runtime.firecracker_binary),
+            ("jailer_binary", runtime.jailer_binary),
+        ):
+            checks[label] = (
+                "ready"
+                if path.is_file() and not path.is_symlink() and os.access(path, os.X_OK)
+                else "missing-or-not-executable"
+            )
+        checks["jailer_chroot_base"] = (
+            "ready"
+            if runtime.chroot_base.is_dir()
+            and not runtime.chroot_base.is_symlink()
+            and os.access(runtime.chroot_base, os.W_OK | os.X_OK)
+            else "missing-or-not-writable"
+        )
+        checks["kvm_device"] = (
+            "ready"
+            if runtime.kvm_device.is_char_device()
+            and not runtime.kvm_device.is_symlink()
+            and os.access(runtime.kvm_device, os.R_OK | os.W_OK)
+            else "unavailable"
+        )
+        try:
+            assets.validate()
+        except FirecrackerConfigurationError:
+            checks["guest_assets"] = "invalid"
+        else:
+            checks["guest_assets"] = "ready"
+        return FirecrackerPreflightReport(
+            ready=all(status == "ready" for status in checks.values()), checks=checks
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class JailerLaunchSpec:
+    """Shell-free supervisor launch plan after it materializes immutable files."""
+
+    job_id: str
+    jailer_argv: tuple[str, ...]
+    config_path: Path
+    manifest_path: Path
+    config_digest: str
+    manifest_digest: str
+
+
+class FirecrackerSupervisorPlan:
+    """Builds an auditable jailer request; lifecycle stays in the supervisor."""
+
+    def __init__(self, runtime: FirecrackerRuntime, *, uid: int, gid: int) -> None:
+        if uid < 0 or gid < 0:
+            raise FirecrackerConfigurationError("jailer uid and gid must be non-negative")
+        self.runtime = runtime
+        self.uid = uid
+        self.gid = gid
+
+    def build(self, launch: "FirecrackerLaunch", *, staging_directory: Path) -> JailerLaunchSpec:
+        if not staging_directory.is_absolute() or staging_directory.is_symlink():
+            raise FirecrackerConfigurationError("supervisor staging directory must be absolute and non-symlink")
+        config_path = staging_directory / f"{launch.job_id}.firecracker.json"
+        manifest_path = staging_directory / f"{launch.job_id}.manifest.json"
+        argv = (
+            str(self.runtime.jailer_binary),
+            "--id",
+            launch.job_id,
+            "--exec-file",
+            str(self.runtime.firecracker_binary),
+            "--uid",
+            str(self.uid),
+            "--gid",
+            str(self.gid),
+            "--chroot-base-dir",
+            str(self.runtime.chroot_base),
+            "--",
+            "--config-file",
+            str(config_path),
+        )
+        return JailerLaunchSpec(
+            job_id=launch.job_id,
+            jailer_argv=argv,
+            config_path=config_path,
+            manifest_path=manifest_path,
+            config_digest=launch.config_digest,
+            manifest_digest=launch.manifest_digest,
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -8,7 +8,8 @@ import hmac
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Iterable
+import re
+from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 from .canonical import canonical_json
@@ -17,6 +18,12 @@ from .models import ActionIntent, Capability, Effect, Provenance, TaskContract
 
 class PolicyDenied(PermissionError):
     """The action is outside the currently authorized task envelope."""
+
+
+_SENSITIVE_ARGUMENT_KEY = re.compile(
+    r"(?:api.?key|token|password|secret|credential|authorization|cookie)", re.I
+)
+_TOKEN_LIKE_VALUE = re.compile(r"(?:bearer\s+|(?:sk|rk|ghp)[_-])[A-Za-z0-9._-]{6,}", re.I)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +65,8 @@ class PolicyGate:
             raise PolicyDenied("intent references a different contract version")
         if intent.tool in self.contract.forbidden_actions:
             raise PolicyDenied(f"forbidden tool: {intent.tool}")
+        if self._contains_inline_secret(intent.arguments):
+            raise PolicyDenied("inline secrets are forbidden; use an executor-owned credential boundary")
         if intent.effect in {Effect.DELETE, Effect.PUBLISH} and not self._is_approved(intent, approvals):
             raise PolicyDenied(f"{intent.effect.value} always requires explicit approval")
 
@@ -135,3 +144,13 @@ class PolicyGate:
         return base64.urlsafe_b64encode(
             hmac.new(self._key, payload.encode("utf-8"), hashlib.sha256).digest()
         ).decode("ascii")
+
+    @classmethod
+    def _contains_inline_secret(cls, value: Any, *, key: str = "") -> bool:
+        if _SENSITIVE_ARGUMENT_KEY.search(key) and value is not None and value != "" and value is not False:
+            return True
+        if isinstance(value, Mapping):
+            return any(cls._contains_inline_secret(item, key=str(item_key)) for item_key, item in value.items())
+        if isinstance(value, (tuple, list, set, frozenset)):
+            return any(cls._contains_inline_secret(item, key=key) for item in value)
+        return isinstance(value, str) and bool(_TOKEN_LIKE_VALUE.search(value))

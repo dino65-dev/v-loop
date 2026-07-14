@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from .completion import RequiredChecksFinalVerifier
 from .controller import VerifiedLoop
 from .ledger import EvidenceLedger
 from .models import (
@@ -60,6 +61,9 @@ def main() -> None:
             executor=DemoExecutor(),
             verifier=HybridVerifier([ExecutionVerifier(), quality]),
             ledger=ledger,
+            final_verifier=RequiredChecksFinalVerifier(
+                {"deterministic check passes": ("execution",)}
+            ),
         )
         print(f"decision={loop.run().value}; ledger_valid={ledger.verify_chain()}")
 

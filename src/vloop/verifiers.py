@@ -11,6 +11,36 @@ class Verifier(Protocol):
     def verify(self, contract: TaskContract, observation: ExecutionObservation) -> CheckResult: ...
 
 
+class StructuralVerifier:
+    """L0 schema validation before any semantic interpretation of evidence."""
+
+    category = "evidence"
+
+    def verify(self, contract: TaskContract, observation: ExecutionObservation) -> CheckResult:
+        del contract
+        valid = (
+            isinstance(observation.success, bool)
+            and (observation.exit_code is None or isinstance(observation.exit_code, int))
+            and isinstance(observation.stdout, str)
+            and isinstance(observation.stderr, str)
+            and isinstance(observation.artifact_digests, Mapping)
+            and isinstance(observation.metadata, Mapping)
+            and all(
+                isinstance(name, str) and isinstance(value, str)
+                for name, value in observation.artifact_digests.items()
+            )
+        )
+        return CheckResult(
+            "structural",
+            CheckStatus.PASS if valid else CheckStatus.FAIL,
+            {
+                "has_mapping_artifacts": isinstance(observation.artifact_digests, Mapping),
+                "has_mapping_metadata": isinstance(observation.metadata, Mapping),
+            },
+            "execution observation does not satisfy the protected schema" if not valid else "",
+        )
+
+
 class ExecutionVerifier:
     """Hard check that an external tool actually completed successfully."""
 
@@ -112,6 +142,81 @@ class BenchmarkEvidenceVerifier:
         )
 
 
+class DifferentialEvidenceVerifier:
+    """L2 reference-comparison receipt verifier.
+
+    A protected evaluator runs the reference and candidate.  The agent only
+    receives its compact receipt; fabricated or incomplete receipts are not a
+    successful differential test.
+    """
+
+    category = "correctness"
+
+    def verify(self, contract: TaskContract, observation: ExecutionObservation) -> CheckResult:
+        del contract
+        receipt = observation.metadata.get("differential")
+        if not isinstance(receipt, Mapping):
+            return CheckResult("differential", CheckStatus.INCONCLUSIVE, {}, "missing differential receipt")
+        required = ("reference_digest", "candidate_digest", "passed")
+        valid = (
+            all(field in receipt for field in required)
+            and isinstance(receipt.get("reference_digest"), str)
+            and bool(receipt.get("reference_digest"))
+            and isinstance(receipt.get("candidate_digest"), str)
+            and bool(receipt.get("candidate_digest"))
+            and isinstance(receipt.get("passed"), bool)
+        )
+        if not valid:
+            return CheckResult(
+                "differential",
+                CheckStatus.FAIL,
+                {"receipt": dict(receipt)},
+                "invalid differential receipt",
+            )
+        return CheckResult(
+            "differential",
+            CheckStatus.PASS if receipt["passed"] else CheckStatus.FAIL,
+            {"receipt": dict(receipt)},
+            "reference comparison failed" if not receipt["passed"] else "",
+        )
+
+
+class MetamorphicEvidenceVerifier:
+    """L2 transformation-invariant receipt verifier."""
+
+    category = "correctness"
+
+    def verify(self, contract: TaskContract, observation: ExecutionObservation) -> CheckResult:
+        del contract
+        receipt = observation.metadata.get("metamorphic")
+        if not isinstance(receipt, Mapping) or not isinstance(receipt.get("relations"), list):
+            return CheckResult("metamorphic", CheckStatus.INCONCLUSIVE, {}, "missing metamorphic receipt")
+        relations = receipt["relations"]
+        valid = bool(relations) and all(
+            isinstance(relation, Mapping)
+            and isinstance(relation.get("name"), str)
+            and bool(relation.get("name"))
+            and isinstance(relation.get("evidence_digest"), str)
+            and bool(relation.get("evidence_digest"))
+            and isinstance(relation.get("passed"), bool)
+            for relation in relations
+        )
+        if not valid:
+            return CheckResult(
+                "metamorphic",
+                CheckStatus.FAIL,
+                {"receipt": dict(receipt)},
+                "invalid metamorphic receipt",
+            )
+        passed = all(relation["passed"] for relation in relations)
+        return CheckResult(
+            "metamorphic",
+            CheckStatus.PASS if passed else CheckStatus.FAIL,
+            {"receipt": dict(receipt)},
+            "a transformation invariant failed" if not passed else "",
+        )
+
+
 class CallableVerifier:
     """Adapter for test, compiler, differential, policy, or quality checks."""
 
@@ -137,9 +242,7 @@ class HybridVerifier:
 
     def __init__(
         self,
-        checks: Iterable[
-            CallableVerifier | ExecutionVerifier | IsolationEvidenceVerifier | BenchmarkEvidenceVerifier
-        ],
+        checks: Iterable[Verifier],
     ) -> None:
         self._checks = tuple(checks)
 

@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from .canonical import canonical_json, digest
 from .ledger import EvidenceLedger
-from .models import VerificationReport
+from .models import CheckResult, CheckStatus, TaskContract, VerificationReport
 
 
 _TOKEN = re.compile(r"[a-z0-9_./-]+")
@@ -77,6 +77,42 @@ class MemoryWriteGate:
         return VerifiedMemory(candidate, source_run_id, now or datetime.now(UTC))
 
 
+class DiagnosedFailureMemoryGate:
+    """Admits reusable failure knowledge only for hard-diagnosed failures.
+
+    A generic model reflection is not sufficient.  The failure must be visible
+    in a deterministic verification report and retain references to the
+    immutable evidence that established it.
+    """
+
+    def promote(
+        self,
+        candidate: MemoryCandidate,
+        report: VerificationReport,
+        *,
+        source_run_id: str,
+        now: datetime | None = None,
+    ) -> VerifiedMemory:
+        if report.correctness is not CheckStatus.FAIL and report.policy is not CheckStatus.FAIL:
+            raise PermissionError("only hard-diagnosed failures can enter failure memory")
+        # Reuse the structural validation in the success gate without allowing
+        # a failed report to masquerade as an accepted one.
+        accepted = VerificationReport(
+            CheckStatus.PASS,
+            CheckStatus.PASS,
+            CheckStatus.PASS,
+            CheckStatus.PASS,
+            report.checks,
+        )
+        verified = MemoryWriteGate().promote(
+            candidate,
+            accepted,
+            source_run_id=source_run_id,
+            now=now,
+        )
+        return replace(verified, status="diagnosed-failure")
+
+
 @dataclass(frozen=True, slots=True)
 class WorkingState:
     """L0 session state. It is never considered reusable memory by itself."""
@@ -121,7 +157,9 @@ class MemoryRecord:
 
     def is_live(self, now: datetime | None = None) -> bool:
         current = now or datetime.now(UTC)
-        return self.status == "verified" and (self.expires_at is None or self.expires_at > current)
+        return self.status in {"verified", "diagnosed-failure"} and (
+            self.expires_at is None or self.expires_at > current
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,3 +431,56 @@ class MemoryService:
             unique.values(),
             key=lambda result: (-result.score, -result.record.promoted_at.timestamp()),
         )[: query.limit]
+
+
+class MemoryCandidateProducer(Protocol):
+    """Server-owned extractor for a bounded, evidence-referenced lesson."""
+
+    def propose(
+        self,
+        *,
+        contract: TaskContract,
+        history: tuple[dict, ...],
+        report: VerificationReport,
+        final_check: CheckResult,
+        available_evidence_refs: tuple[str, ...],
+    ) -> MemoryCandidate | None: ...
+
+
+class VerifiedMemoryCommitter:
+    """Commits a candidate only after final-goal verification and attestation.
+
+    This component is intentionally separate from the planner.  It verifies
+    that every cited event hash exists in the evidence ledger before the
+    canonical memory ledger receives the record.
+    """
+
+    def __init__(
+        self,
+        memory_ledger: MemoryLedger,
+        evidence_ledger: EvidenceLedger,
+        write_gate: MemoryWriteGate | None = None,
+    ) -> None:
+        self.memory_ledger = memory_ledger
+        self.evidence_ledger = evidence_ledger
+        self.write_gate = write_gate or MemoryWriteGate()
+
+    def commit(
+        self,
+        candidate: MemoryCandidate,
+        *,
+        report: VerificationReport,
+        final_check: CheckResult,
+        source_run_id: str,
+        available_evidence_refs: tuple[str, ...],
+    ) -> MemoryRecord:
+        if final_check.status is not CheckStatus.PASS:
+            raise PermissionError("final-goal verification is required for reusable memory")
+        allowed = set(available_evidence_refs)
+        cited = set(candidate.evidence_refs)
+        if not cited.issubset(allowed):
+            raise PermissionError("memory cites evidence outside this completed run")
+        if not self.evidence_ledger.contains_event_hashes(cited):
+            raise PermissionError("memory cites unknown evidence")
+        verified = self.write_gate.promote(candidate, report, source_run_id=source_run_id)
+        return self.memory_ledger.insert(verified)

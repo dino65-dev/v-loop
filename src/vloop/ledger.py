@@ -82,6 +82,23 @@ class EvidenceLedger:
             for row in rows
         ]
 
+    def contains_event_hashes(self, event_hashes: set[str] | frozenset[str]) -> bool:
+        """Return whether every supplied hash is present in this ledger.
+
+        This is deliberately a membership check rather than a lookup that
+        returns event payloads.  Memory promotion needs to attest references
+        without exposing all historic evidence to a caller.
+        """
+
+        if not event_hashes:
+            return False
+        placeholders = ",".join("?" for _ in event_hashes)
+        row = self._connection.execute(
+            f"SELECT COUNT(*) FROM ledger_events WHERE event_hash IN ({placeholders})",
+            tuple(event_hashes),
+        ).fetchone()
+        return bool(row and row[0] == len(event_hashes))
+
     def verify_chain(self) -> bool:
         parent_hash = "0" * 64
         for event in self.events():

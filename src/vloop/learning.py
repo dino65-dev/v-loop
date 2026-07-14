@@ -49,8 +49,13 @@ class TraceDatasetBuilder:
             "intent.proposed",
             "execution.observed",
             "verification.completed",
+            "final-goal.completed",
             "neural.shadow.completed",
             "repair.directive",
+            "probe.completed",
+            "context.packaged",
+            "memory.promoted",
+            "memory.committed",
             "run.terminal",
         }
     )
@@ -85,11 +90,24 @@ class TraceDatasetBuilder:
                 ),
                 None,
             )
-            if terminal is None or verification is None:
+            final_goal = next(
+                (
+                    event
+                    for event in reversed(run_events)
+                    if event["event_type"] == "final-goal.completed"
+                ),
+                None,
+            )
+            if terminal is None or verification is None or final_goal is None:
                 continue
             terminal_payload = terminal["payload"]
             verification_payload = verification["payload"]
-            if terminal_payload.get("decision") == "accept" and verification_payload.get("accepted") is True:
+            final_payload = final_goal["payload"]
+            if (
+                terminal_payload.get("decision") == "accept"
+                and verification_payload.get("accepted") is True
+                and final_payload.get("status") == "pass"
+            ):
                 label = "verified-success"
             elif terminal_payload.get("decision") in {"escalate", "stop"} and (
                 verification_payload.get("correctness") == "fail"

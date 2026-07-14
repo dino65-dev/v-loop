@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime
+import os
 from pathlib import Path
 
 import pytest
 
+from vloop.completion import RequiredChecksFinalVerifier
 from vloop.controller import VerifiedLoop
 from vloop.contract_compiler import (
     ContractCompilationError,
@@ -14,13 +16,22 @@ from vloop.contract_compiler import (
     TaskContractCompiler,
     ToolAuthority,
 )
-from vloop.context import ContextEngine, ContextItem, ContextTrust, EnvironmentFingerprint
-from vloop.delegation import DelegationEvidence, DelegationGate
+from vloop.context import ContextEngine, ContextItem, ContextPackage, ContextTrust, EnvironmentFingerprint
+from vloop.delegation import (
+    DelegationEvidence,
+    DelegationGate,
+    SpecialistDispatcher,
+    SpecialistResult,
+    SpecialistTask,
+)
 from vloop.executor import BubblewrapExecutor
 from vloop.firecracker import (
     FirecrackerAssets,
     FirecrackerExecutor,
     FirecrackerJobBuilder,
+    FirecrackerPreflight,
+    FirecrackerRuntime,
+    FirecrackerSupervisorPlan,
     GuestExecutionResult,
     MicroVMResources,
 )
@@ -31,7 +42,12 @@ from vloop.learning import (
     ModelPromotionGate,
     TraceDatasetBuilder,
 )
-from vloop.memory import MemoryCandidate, MemoryWriteGate
+from vloop.memory import (
+    DiagnosedFailureMemoryGate,
+    MemoryCandidate,
+    MemoryWriteGate,
+    VerifiedMemoryCommitter,
+)
 from vloop.memory import (
     ExternalMemoryIndex,
     MemoryLedger,
@@ -55,13 +71,17 @@ from vloop.models import (
 from vloop.neural_verifier import ShadowNeuralVerifier
 from vloop.neural_verifier import OpenAICompatibleDiagnosticBackend
 from vloop.policy import Approval, PolicyDenied, PolicyGate
+from vloop.probes import CallableProbe, ProbeDefinition, ProbeKind, ProtectedProbeRunner
 from vloop.repair import RepairController
 from vloop.verifiers import (
     BenchmarkEvidenceVerifier,
     CallableVerifier,
+    DifferentialEvidenceVerifier,
     ExecutionVerifier,
     HybridVerifier,
     IsolationEvidenceVerifier,
+    MetamorphicEvidenceVerifier,
+    StructuralVerifier,
 )
 
 
@@ -92,6 +112,10 @@ def intent(
         contract_id=task.contract_id,
         contract_version=task.version,
     )
+
+
+def final_verifier() -> RequiredChecksFinalVerifier:
+    return RequiredChecksFinalVerifier({"command passes": ("execution",)})
 
 
 def test_policy_binds_capability_and_blocks_tainted_write() -> None:
@@ -181,6 +205,7 @@ def test_loop_accepts_only_after_independent_checks(tmp_path: Path) -> None:
         executor=Executor(),
         verifier=HybridVerifier([ExecutionVerifier(), quality, evidence]),
         ledger=ledger,
+        final_verifier=final_verifier(),
     )
     assert loop.run() is LoopDecision.ACCEPT
     assert ledger.verify_chain()
@@ -344,6 +369,7 @@ def test_neural_shadow_diagnostic_is_redacted_and_cannot_override_acceptance(tmp
         verifier=HybridVerifier([ExecutionVerifier(), quality, evidence]),
         ledger=ledger,
         shadow_verifier=ShadowNeuralVerifier(backend),
+        final_verifier=final_verifier(),
     )
     assert loop.run() is LoopDecision.ACCEPT
     assert "ok" not in backend.user
@@ -396,6 +422,11 @@ def test_trace_dataset_exports_only_verified_sanitized_runs() -> None:
                 "event_type": "verification.completed",
                 "event_hash": "two",
                 "payload": {"run_id": "good", "accepted": True},
+            },
+            {
+                "event_type": "final-goal.completed",
+                "event_hash": "two-final",
+                "payload": {"run_id": "good", "status": "pass"},
             },
             {
                 "event_type": "run.terminal",
@@ -567,3 +598,286 @@ def test_firecracker_rejects_network_and_manifest_mismatch(tmp_path: Path) -> No
             return GuestExecutionResult("wrong", True, 0, "", "", {}, "/job/vloop-result.json")
 
     assert not FirecrackerExecutor(builder, BadSupervisor()).execute(intent(task)).success
+
+
+def test_final_goal_verifier_is_required_before_controller_acceptance(tmp_path: Path) -> None:
+    task = replace(contract(), maximum_iterations=2)
+    quality = CallableVerifier(
+        "benchmark",
+        "quality",
+        lambda _contract, _obs: CheckResult("benchmark", CheckStatus.PASS, {"samples": 10}),
+    )
+    evidence = CallableVerifier(
+        "evidence",
+        "evidence",
+        lambda _contract, _obs: CheckResult("evidence", CheckStatus.PASS, {"artifact": "hash"}),
+    )
+    ledger = EvidenceLedger(tmp_path / "ledger.db")
+    loop = VerifiedLoop(
+        contract=task,
+        planner=Planner(task),
+        gate=PolicyGate(task, signing_key=b"q" * 32),
+        executor=Executor(),
+        verifier=HybridVerifier([ExecutionVerifier(), quality, evidence]),
+        ledger=ledger,
+    )
+    assert loop.run() is LoopDecision.ESCALATE
+    final_events = [event for event in ledger.events() if event["event_type"] == "final-goal.completed"]
+    assert final_events[-1]["payload"]["status"] == "inconclusive"
+
+
+class MemoryProducer:
+    def propose(
+        self,
+        *,
+        contract: TaskContract,
+        history: tuple[dict, ...],
+        report: VerificationReport,
+        final_check: CheckResult,
+        available_evidence_refs: tuple[str, ...],
+    ) -> MemoryCandidate:
+        del contract, history, report, final_check
+        return MemoryCandidate(
+            "A final protected check passed for the bounded command",
+            "v-loop",
+            {"executor": "test"},
+            available_evidence_refs,
+            0.9,
+            "internal",
+        )
+
+
+def test_controller_promotes_only_finally_verified_and_attested_memory(tmp_path: Path) -> None:
+    task = contract()
+    quality = CallableVerifier(
+        "benchmark",
+        "quality",
+        lambda _contract, _obs: CheckResult("benchmark", CheckStatus.PASS, {"samples": 10}),
+    )
+    evidence = CallableVerifier(
+        "evidence",
+        "evidence",
+        lambda _contract, _obs: CheckResult("evidence", CheckStatus.PASS, {"artifact": "hash"}),
+    )
+    ledger = EvidenceLedger(tmp_path / "evidence.db")
+    memories = MemoryLedger(tmp_path / "memory.db", ledger)
+    loop = VerifiedLoop(
+        contract=task,
+        planner=Planner(task),
+        gate=PolicyGate(task, signing_key=b"m" * 32),
+        executor=Executor(),
+        verifier=HybridVerifier([ExecutionVerifier(), quality, evidence]),
+        ledger=ledger,
+        final_verifier=final_verifier(),
+        memory_committer=VerifiedMemoryCommitter(memories, ledger),
+        memory_candidate_producer=MemoryProducer(),
+    )
+    assert loop.run() is LoopDecision.ACCEPT
+    records = memories.records(MemoryQuery("protected command", "v-loop"))
+    assert len(records) == 1
+    assert all(ledger.contains_event_hashes({event_hash}) for event_hash in records[0].evidence_refs)
+    assert any(event["event_type"] == "memory.committed" for event in ledger.events())
+
+
+def test_diagnosed_failure_memory_needs_a_hard_failure(tmp_path: Path) -> None:
+    candidate = MemoryCandidate("compiler flag failed", "v-loop", {}, ("evidence",), 0.8, "internal")
+    failure = VerificationReport(
+        CheckStatus.FAIL, CheckStatus.PASS, CheckStatus.PASS, CheckStatus.PASS, ()
+    )
+    record = DiagnosedFailureMemoryGate().promote(candidate, failure, source_run_id="run")
+    assert record.status == "diagnosed-failure"
+    with pytest.raises(PermissionError):
+        DiagnosedFailureMemoryGate().promote(
+            candidate,
+            VerificationReport(
+                CheckStatus.PASS, CheckStatus.PASS, CheckStatus.PASS, CheckStatus.PASS, ()
+            ),
+            source_run_id="run",
+        )
+
+
+def test_probes_are_registered_protected_checks_and_run_after_evidence_gap(tmp_path: Path) -> None:
+    task = replace(contract(), maximum_iterations=2)
+    calls = 0
+
+    def probe(
+        _contract: TaskContract,
+        _intent: ActionIntent,
+        _observation: ExecutionObservation,
+        _report: VerificationReport,
+    ) -> CheckResult:
+        nonlocal calls
+        calls += 1
+        return CheckResult("probe:empty-input", CheckStatus.PASS, {"case": "empty"})
+
+    probe_runner = ProtectedProbeRunner(
+        [
+            CallableProbe(
+                ProbeDefinition("empty-input", ProbeKind.EDGE_CASE, "test empty input"),
+                probe,
+            )
+        ]
+    )
+    evidence = CallableVerifier(
+        "evidence",
+        "evidence",
+        lambda _contract, _obs: CheckResult("evidence", CheckStatus.INCONCLUSIVE, {}, "need probe"),
+    )
+    ledger = EvidenceLedger(tmp_path / "ledger.db")
+    loop = VerifiedLoop(
+        contract=task,
+        planner=Planner(task),
+        gate=PolicyGate(task, signing_key=b"p" * 32),
+        executor=Executor(),
+        verifier=HybridVerifier([ExecutionVerifier(), evidence]),
+        ledger=ledger,
+        probe_runner=probe_runner,
+    )
+    assert loop.run() is LoopDecision.ESCALATE
+    assert calls >= 1
+    assert any(event["event_type"] == "probe.completed" for event in ledger.events())
+
+
+class UntrustedContextProvider:
+    def build(self, *, contract: TaskContract, history: tuple[dict, ...]) -> ContextPackage:
+        del history
+        return ContextPackage(
+            contract.contract_digest,
+            "environment-hash",
+            (),
+            (ContextItem("retrieval", "web", "untrusted data", ContextTrust.UNTRUSTED),),
+            None,
+            (),
+        )
+
+
+class WritePlanner:
+    def propose(self, *, contract: TaskContract, history: tuple[dict, ...]) -> ActionIntent:
+        del history
+        return ActionIntent(
+            "file.write",
+            Effect.WRITE,
+            "/workspace/result.txt",
+            {"content": "safe"},
+            (Provenance.USER,),
+            "write bounded output",
+            contract.contract_id,
+            contract.version,
+        )
+
+
+def test_context_taint_is_conservatively_propagated_to_policy(tmp_path: Path) -> None:
+    task = TaskContract(
+        "write a bounded file",
+        ("file exists",),
+        (ActionRule("file.write", Effect.WRITE, "/workspace"),),
+    )
+    ledger = EvidenceLedger(tmp_path / "ledger.db")
+    loop = VerifiedLoop(
+        contract=task,
+        planner=WritePlanner(),
+        gate=PolicyGate(task, signing_key=b"c" * 32),
+        executor=Executor(),
+        verifier=HybridVerifier([ExecutionVerifier()]),
+        ledger=ledger,
+        context_provider=UntrustedContextProvider(),
+    )
+    assert loop.run() is LoopDecision.ESCALATE
+    proposed = next(event for event in ledger.events() if event["event_type"] == "intent.proposed")
+    assert Provenance.UNTRUSTED_RETRIEVAL.value in proposed["payload"]["provenance"]
+
+
+def test_policy_rejects_inline_secret_arguments() -> None:
+    task = contract()
+    leaky = ActionIntent(
+        "command.run",
+        Effect.EXECUTE,
+        "/workspace/a",
+        {"authorization": "Bearer abcdefghijk"},
+        (Provenance.USER,),
+        "must not pass credentials through the action",
+        task.contract_id,
+        task.version,
+    )
+    with pytest.raises(PolicyDenied, match="inline secrets"):
+        PolicyGate(task, signing_key=b"s" * 32).authorize(leaky)
+
+
+class CountingSpecialist:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def execute(self, task: SpecialistTask) -> SpecialistResult:
+        self.calls += 1
+        return SpecialistResult("advisory test strategy", {"task": task.task_digest}, 100)
+
+
+def test_specialist_dispatch_requires_evidence_and_keeps_output_advisory(tmp_path: Path) -> None:
+    specialist = CountingSpecialist()
+    denied = SpecialistDispatcher(DelegationGate(()), {"test-generator": specialist})
+    task = SpecialistTask("code", "test-generator", "suggest a test", {}, 100)
+    assert not denied.dispatch(task).allowed
+    assert specialist.calls == 0
+
+    ledger = EvidenceLedger(tmp_path / "ledger.db")
+    allowed = SpecialistDispatcher(
+        DelegationGate(
+            (DelegationEvidence("code", "test-generator", True, 0.5, 0.7, 100),)
+        ),
+        {"test-generator": specialist},
+        ledger,
+    )
+    dispatched = allowed.dispatch(task)
+    assert dispatched.allowed and dispatched.invoked and dispatched.result is not None
+    assert specialist.calls == 1
+    assert "advisory test strategy" not in str(ledger.events())
+
+
+def test_structural_differential_and_metamorphic_receipts_are_hard_checks() -> None:
+    task = contract()
+    observation = ExecutionObservation(
+        True,
+        0,
+        "",
+        "",
+        {"candidate": "candidate-hash"},
+        {
+            "differential": {
+                "reference_digest": "reference-hash",
+                "candidate_digest": "candidate-hash",
+                "passed": True,
+            },
+            "metamorphic": {
+                "relations": [
+                    {"name": "permutation", "evidence_digest": "relation-hash", "passed": True}
+                ]
+            },
+        },
+    )
+    report = HybridVerifier(
+        [StructuralVerifier(), ExecutionVerifier(), DifferentialEvidenceVerifier(), MetamorphicEvidenceVerifier()]
+    ).verify(task, observation)
+    assert report.accepted
+
+
+def test_firecracker_supervisor_preflight_fails_closed_and_plan_is_shell_free(tmp_path: Path) -> None:
+    kernel, rootfs, drive = (tmp_path / "vmlinux", tmp_path / "rootfs.ext4", tmp_path / "job.ext4")
+    for asset in (kernel, rootfs, drive):
+        asset.write_bytes(b"asset")
+    firecracker = tmp_path / "firecracker"
+    firecracker.write_text("binary")
+    firecracker.chmod(os.stat(firecracker).st_mode | 0o111)
+    chroot = tmp_path / "jailer"
+    chroot.mkdir()
+    assets = FirecrackerAssets(kernel, rootfs, drive)
+    runtime = FirecrackerRuntime(firecracker, tmp_path / "missing-jailer", chroot, tmp_path / "missing-kvm")
+    preflight = FirecrackerPreflight.check(runtime, assets)
+    assert not preflight.ready
+    assert preflight.checks["jailer_binary"] == "missing-or-not-executable"
+    launch = FirecrackerJobBuilder(assets).build(intent(contract()))
+    plan = FirecrackerSupervisorPlan(runtime, uid=1000, gid=1000).build(
+        launch, staging_directory=tmp_path
+    )
+    assert plan.jailer_argv[0] == str(runtime.jailer_binary)
+    assert "--" in plan.jailer_argv
+    assert plan.manifest_digest == launch.manifest_digest
