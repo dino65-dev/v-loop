@@ -9,12 +9,14 @@ from uuid import uuid4
 
 from .canonical import digest
 from .completion import EvidenceAccumulator, FinalVerifier
-from .context import ContextPackage
+from .context import ContextPackage, ContextTrust
 from .executor import Executor
 from .ledger import EvidenceLedger
 from .memory import MemoryCandidateProducer, VerifiedMemoryCommitter
 from .models import (
     ActionIntent,
+    ArgumentProvenance,
+    ArgumentProvenanceNode,
     CheckResult,
     CheckStatus,
     ExecutionObservation,
@@ -27,6 +29,7 @@ from .neural_verifier import ShadowNeuralVerifier
 from .policy import Approval, PolicyDenied, PolicyGate, SignedApprovalReceipt
 from .probes import ProbeReport, ProtectedProbeRunner
 from .repair import RepairController
+from .run_state import RunCheckpoint, RunPhase, RunStateStore
 from .verifiers import HybridVerifier
 
 
@@ -69,6 +72,8 @@ class VerifiedLoop:
         context_provider: ContextProvider | None = None,
         memory_committer: VerifiedMemoryCommitter | None = None,
         memory_candidate_producer: MemoryCandidateProducer | None = None,
+        state_store: RunStateStore | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.contract = contract
         self.planner = planner
@@ -83,33 +88,44 @@ class VerifiedLoop:
         self.context_provider = context_provider
         self.memory_committer = memory_committer
         self.memory_candidate_producer = memory_candidate_producer
-        self.run_id = str(uuid4())
+        self.state_store = state_store
+        self.run_id = run_id or str(uuid4())
         self._evidence = EvidenceAccumulator(self.run_id)
         self._history: list[dict] = []
         self._seen_failures: set[tuple[str, str]] = set()
         self._tool_calls = 0
+        self._checkpoint: RunCheckpoint | None = None
 
     def run(self, approvals: Iterable[Approval | SignedApprovalReceipt] = ()) -> LoopDecision:
-        self.ledger.append(
-            "run.started",
-            {"run_id": self.run_id, "contract_digest": self.contract.contract_digest},
-        )
-        for iteration in range(1, self.contract.maximum_iterations + 1):
+        resumed_terminal = self._restore_or_start()
+        if resumed_terminal is not None:
+            return resumed_terminal
+        start_iteration = self._checkpoint.next_iteration if self._checkpoint is not None else 1
+        for iteration in range(start_iteration, self.contract.maximum_iterations + 1):
             if self._tool_calls >= self.contract.maximum_tool_calls:
                 return self._terminal(LoopDecision.STOP, "tool-call-budget-exhausted")
-            intent = self._propose()
-            self.ledger.append(
-                "intent.proposed",
-                {
-                    "run_id": self.run_id,
-                    "iteration": iteration,
-                    "intent_digest": intent.intent_digest,
-                    "tool": intent.tool,
-                    "effect": intent.effect.value,
-                    "target": intent.target,
-                    "provenance": [value.value for value in intent.provenance],
-                },
-            )
+            if self._checkpoint is not None and self._checkpoint.phase is RunPhase.PENDING_AUTHORIZATION:
+                intent = self._checkpoint.pending_intent
+                assert intent is not None  # checkpoint invariant
+                self.ledger.append(
+                    "intent.resumed",
+                    {"run_id": self.run_id, "iteration": iteration, "intent_digest": intent.intent_digest},
+                )
+            else:
+                intent = self._propose()
+                self.ledger.append(
+                    "intent.proposed",
+                    {
+                        "run_id": self.run_id,
+                        "iteration": iteration,
+                        "intent_digest": intent.intent_digest,
+                        "tool": intent.tool,
+                        "effect": intent.effect.value,
+                        "target": intent.target,
+                        "provenance": [value.value for value in intent.provenance],
+                    },
+                )
+                self._checkpoint_pending_authorization(iteration, intent)
             try:
                 capability = self.gate.authorize(
                     intent,
@@ -128,6 +144,14 @@ class VerifiedLoop:
                 return self._terminal(LoopDecision.ESCALATE, "policy-denied")
 
             self._tool_calls += 1
+            # Persist before the effect starts. A process death after this
+            # transition is never retried by the controller; the executor's
+            # idempotency/supervisor record must be reconciled first.
+            self._checkpoint_pending_effect(iteration, intent)
+            self.ledger.append(
+                "execution.started",
+                {"run_id": self.run_id, "iteration": iteration, "intent_digest": intent.intent_digest},
+            )
             binder = getattr(self.executor, "bind_run", None)
             if callable(binder):
                 binder(self.run_id, self.contract.contract_digest)
@@ -192,6 +216,41 @@ class VerifiedLoop:
                 },
             )
             diagnostic = self._record_shadow_diagnostic(intent, observation, report)
+            # An action can safely contribute one task criterion without also
+            # producing every other whole-task receipt.  Missing criteria are
+            # progress, not an action failure. Hard verifier failures still
+            # follow the repair path below.
+            if (
+                not report.accepted
+                and self.final_verifier is not None
+                and self._safe_for_criterion_progress(observation, report)
+            ):
+                final_check, _final_event_hash = self._verify_final_goal(report)
+                if final_check.status is CheckStatus.PASS:
+                    self._commit_verified_memory(
+                        report=report,
+                        final_check=final_check,
+                        evidence_refs=(execution_event_hash, verification_event_hash, _final_event_hash),
+                    )
+                    return self._terminal(LoopDecision.ACCEPT, "verified-success")
+                self._history.append(
+                    {
+                        "intent": intent.intent_digest,
+                        "task_progress": True,
+                        "final_status": final_check.status.value,
+                        "criterion_statuses": dict(final_check.evidence.get("condition_statuses", {})),
+                    }
+                )
+                self.ledger.append(
+                    "criterion.progressed",
+                    {
+                        "run_id": self.run_id,
+                        "intent_digest": intent.intent_digest,
+                        "final_status": final_check.status.value,
+                    },
+                )
+                self._checkpoint_ready(iteration + 1)
+                continue
             if report.accepted:
                 final_check, final_event_hash = self._verify_final_goal(report)
                 if final_check.status is CheckStatus.PASS:
@@ -229,6 +288,7 @@ class VerifiedLoop:
                         "final_goal_message": final_check.message[:240],
                     }
                 )
+                self._checkpoint_ready(iteration + 1)
                 continue
 
             directive = self.repair_controller.direct(report, diagnostic)
@@ -266,7 +326,128 @@ class VerifiedLoop:
                     ),
                 }
             )
+            self._checkpoint_ready(iteration + 1)
         return self._terminal(LoopDecision.STOP, "iteration-budget-exhausted")
+
+    def _restore_or_start(self) -> LoopDecision | None:
+        """Restore a safe checkpoint, never a potentially executed effect."""
+
+        if self.state_store is None:
+            self.ledger.append(
+                "run.started",
+                {"run_id": self.run_id, "contract_digest": self.contract.contract_digest},
+            )
+            return None
+        checkpoint = self.state_store.load(self.run_id)
+        if checkpoint is None:
+            checkpoint = RunCheckpoint(
+                run_id=self.run_id,
+                contract_digest=self.contract.contract_digest,
+                phase=RunPhase.READY,
+                next_iteration=1,
+                tool_calls=0,
+                history=(),
+                seen_failures=(),
+                evidence=self._evidence.snapshot(),
+            )
+            self._checkpoint = self.state_store.save(checkpoint)
+            self.ledger.append(
+                "run.started",
+                {"run_id": self.run_id, "contract_digest": self.contract.contract_digest},
+            )
+            return None
+        if checkpoint.contract_digest != self.contract.contract_digest:
+            raise ValueError("persisted run state belongs to a different task contract")
+        if checkpoint.next_iteration > self.contract.maximum_iterations + 1:
+            raise ValueError("persisted run state exceeds the contract iteration budget")
+        self._checkpoint = checkpoint
+        self._tool_calls = checkpoint.tool_calls
+        self._history = list(checkpoint.history)
+        self._seen_failures = set(checkpoint.seen_failures)
+        self._evidence = EvidenceAccumulator.from_snapshot(checkpoint.evidence)
+        if checkpoint.phase is RunPhase.TERMINAL:
+            try:
+                return LoopDecision(checkpoint.terminal_decision or "")
+            except ValueError as exc:
+                raise ValueError("persisted terminal decision is invalid") from exc
+        if checkpoint.phase is RunPhase.PENDING_EFFECT:
+            self.ledger.append(
+                "run.resume.blocked",
+                {
+                    "run_id": self.run_id,
+                    "reason": "pending-effect-requires-reconciliation",
+                    "intent_digest": checkpoint.pending_intent.intent_digest if checkpoint.pending_intent else "",
+                },
+            )
+            return self._terminal(LoopDecision.WAITING, "indeterminate-pending-effect")
+        self.ledger.append(
+            "run.resumed",
+            {
+                "run_id": self.run_id,
+                "next_iteration": checkpoint.next_iteration,
+                "phase": checkpoint.phase.value,
+            },
+        )
+        return None
+
+    def _save_checkpoint(
+        self,
+        *,
+        phase: RunPhase,
+        next_iteration: int,
+        pending_intent: ActionIntent | None = None,
+        terminal_decision: LoopDecision | None = None,
+        terminal_reason: str | None = None,
+    ) -> None:
+        if self.state_store is None:
+            return
+        if self._checkpoint is None:  # pragma: no cover - internal lifecycle invariant
+            raise RuntimeError("run checkpoint was not initialized")
+        checkpoint = RunCheckpoint(
+            run_id=self.run_id,
+            contract_digest=self.contract.contract_digest,
+            phase=phase,
+            next_iteration=next_iteration,
+            tool_calls=self._tool_calls,
+            history=tuple(self._history),
+            seen_failures=tuple(sorted(self._seen_failures)),
+            evidence=self._evidence.snapshot(),
+            pending_intent=pending_intent,
+            terminal_decision=terminal_decision.value if terminal_decision is not None else None,
+            terminal_reason=terminal_reason,
+            revision=self._checkpoint.revision,
+        )
+        self._checkpoint = self.state_store.save(checkpoint)
+
+    def _checkpoint_pending_authorization(self, iteration: int, intent: ActionIntent) -> None:
+        self._save_checkpoint(
+            phase=RunPhase.PENDING_AUTHORIZATION,
+            next_iteration=iteration,
+            pending_intent=intent,
+        )
+
+    def _checkpoint_pending_effect(self, iteration: int, intent: ActionIntent) -> None:
+        self._save_checkpoint(
+            phase=RunPhase.PENDING_EFFECT,
+            next_iteration=iteration,
+            pending_intent=intent,
+        )
+
+    def _checkpoint_ready(self, next_iteration: int) -> None:
+        self._save_checkpoint(phase=RunPhase.READY, next_iteration=next_iteration)
+
+    @staticmethod
+    def _safe_for_criterion_progress(
+        observation: ExecutionObservation, report: VerificationReport
+    ) -> bool:
+        """Separate action safety from incomplete whole-task evidence."""
+
+        structural = next((check for check in report.checks if check.name == "structural"), None)
+        return (
+            observation.success
+            and not any(check.status is CheckStatus.FAIL for check in report.checks)
+            and (structural is None or structural.status is CheckStatus.PASS)
+        )
 
     def _propose(self) -> ActionIntent:
         history = tuple(self._history)
@@ -291,23 +472,102 @@ class VerifiedLoop:
             intent = contextual(contract=self.contract, history=history, context=context)
         else:
             intent = self.planner.propose(contract=self.contract, history=history)
-        if context is None:
-            return intent
-        # A controller cannot inspect a model's attention.  Conservatively mark
-        # every action argument proposed with a package containing untrusted
-        # material as tainted; PolicyGate can then reason at argument granularity
-        # instead of relying on a single self-declared action label.
-        provenance = tuple(sorted(set(intent.provenance).union(context.provenance), key=lambda value: value.value))
-        argument_provenance = {
-            name: tuple(
-                sorted(
-                    set(intent.provenance_for_argument(name)).union(context.provenance),
-                    key=lambda value: value.value,
+        if context is not None:
+            # A controller cannot inspect a model's attention. Conservatively
+            # mark every action argument proposed with a package containing
+            # untrusted material as tainted, then preserve the exact package
+            # inputs as nodes in each argument's provenance DAG.
+            provenance = tuple(
+                sorted(set(intent.provenance).union(context.provenance), key=lambda value: value.value)
+            )
+            argument_provenance = {
+                name: tuple(
+                    sorted(
+                        set(intent.provenance_for_argument(name)).union(context.provenance),
+                        key=lambda value: value.value,
+                    )
+                )
+                for name in intent.arguments
+            }
+            intent = replace(intent, provenance=provenance, argument_provenance=argument_provenance)
+        if self.contract.require_argument_provenance:
+            return self._bind_argument_provenance(intent, context)
+        return intent
+
+    @staticmethod
+    def _bind_argument_provenance(
+        intent: ActionIntent, context: ContextPackage | None
+    ) -> ActionIntent:
+        """Bind each submitted value to a causal, non-content-bearing DAG.
+
+        Planner-provided graphs are deliberately not trusted. The controller
+        creates fresh source nodes from its own context package and a mandatory
+        model-output derivation node for every value. This conservatively taints
+        values when untrusted context was in scope without pretending to know
+        the model's attention pattern.
+        """
+
+        context_nodes: list[ArgumentProvenanceNode] = []
+        if context is not None:
+            for index, item in enumerate((*context.trusted_items, *context.untrusted_items)):
+                provenance = {
+                    ContextTrust.USER: Provenance.USER,
+                    ContextTrust.TRUSTED_REPOSITORY: Provenance.TRUSTED_REPOSITORY,
+                    ContextTrust.VERIFIED_MEMORY: Provenance.VERIFIED_MEMORY,
+                    ContextTrust.UNTRUSTED: Provenance.UNTRUSTED_RETRIEVAL,
+                    ContextTrust.TRUSTED_SYSTEM: Provenance.TOOL_OUTPUT,
+                }[item.trust]
+                context_nodes.append(
+                    ArgumentProvenanceNode(
+                        node_id=f"context:{index}:{item.content_digest[:16]}",
+                        provenance=provenance,
+                        source_id=item.source_id,
+                        content_digest=item.content_digest,
+                    )
+                )
+
+        graphs: dict[str, ArgumentProvenance] = {}
+        for name, value in intent.arguments.items():
+            nodes = list(context_nodes)
+            # A pre-existing untrusted label may only make the action more
+            # restrictive. It cannot supply a trusted source node.
+            if (
+                Provenance.UNTRUSTED_RETRIEVAL in intent.provenance
+                or Provenance.UNTRUSTED_RETRIEVAL in intent.argument_provenance.get(name, ())
+            ):
+                nodes.append(
+                    ArgumentProvenanceNode(
+                        node_id="declared-untrusted-input",
+                        provenance=Provenance.UNTRUSTED_RETRIEVAL,
+                        source_id="untrusted-planner-declaration",
+                        content_digest=digest({"argument": name, "value": value}),
+                    )
+                )
+            if not nodes:
+                nodes.append(
+                    ArgumentProvenanceNode(
+                        node_id="planner-output-root",
+                        provenance=Provenance.TOOL_OUTPUT,
+                        source_id="planner-output",
+                        content_digest=digest({"argument": name, "value": value}),
+                    )
+                )
+            parents = {
+                parent for node in nodes for parent in node.parent_ids
+            }
+            terminals = tuple(sorted(node.node_id for node in nodes if node.node_id not in parents))
+            derived_id = f"controller-derived:{digest({'argument': name, 'value': value})[:16]}"
+            nodes.append(
+                ArgumentProvenanceNode(
+                    node_id=derived_id,
+                    provenance=Provenance.TOOL_OUTPUT,
+                    source_id="controller-planner-boundary",
+                    content_digest=digest(value),
+                    parent_ids=terminals,
                 )
             )
-            for name in intent.arguments
-        }
-        return replace(intent, provenance=provenance, argument_provenance=argument_provenance)
+            graphs[name] = ArgumentProvenance(digest(value), tuple(nodes))
+        return replace(intent, argument_provenance_graph=graphs)
 
     def _record_shadow_diagnostic(
         self, intent: ActionIntent, observation: ExecutionObservation, report: VerificationReport
@@ -504,6 +764,15 @@ class VerifiedLoop:
         )
 
     def _terminal(self, decision: LoopDecision, reason: str) -> LoopDecision:
+        # Terminal state has no side effect, so persist it before its audit
+        # event. A restart then returns the same decision rather than entering
+        # the planner again if ledger publication is briefly unavailable.
+        self._save_checkpoint(
+            phase=RunPhase.TERMINAL,
+            next_iteration=(self._checkpoint.next_iteration if self._checkpoint is not None else 1),
+            terminal_decision=decision,
+            terminal_reason=reason,
+        )
         self.ledger.append(
             "run.terminal",
             {

@@ -12,7 +12,7 @@ KVM access and, in production, its jailer execution environment.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
@@ -215,6 +215,8 @@ class GuestExecutionResult:
     artifact_digests: Mapping[str, str]
     result_path: str
     supervisor_receipt: Mapping[str, Any] | None = None
+    result_file_digest: str = ""
+    usage: Mapping[str, int] = field(default_factory=dict)
 
 
 class FirecrackerJobBuilder:
@@ -313,6 +315,12 @@ class FirecrackerExecutor:
     def supervisor_receipt_verifier(self) -> ReceiptVerifier | None:
         return self._supervisor_receipt_verifier
 
+    @property
+    def supervisor(self) -> FirecrackerSupervisor:
+        """The narrow service client; it never grants host VM authority."""
+
+        return self._supervisor
+
     def bind_run(self, run_id: str, contract_digest: str | None = None) -> None:
         self._run_id = run_id
         self._contract_digest = contract_digest
@@ -400,4 +408,25 @@ class FirecrackerExecutor:
             or claims.get("job_drive_destroyed") is not True
         ):
             return "supervisor receipt lacks required job lifecycle attestations"
+        expected_result = "pass" if result.success and result.exit_code == 0 else "fail"
+        if receipt.result != expected_result:
+            return "supervisor receipt result disagrees with guest execution outcome"
+        expected_claims = {
+            "exit_code": result.exit_code,
+            "result_path": result.result_path,
+            "stdout_digest": digest(result.stdout),
+            "stderr_digest": digest(result.stderr),
+            "result_file_digest": result.result_file_digest,
+        }
+        if any(claims.get(name) != value for name, value in expected_claims.items()):
+            return "supervisor receipt does not bind the exact guest result"
+        if not isinstance(claims.get("job_drive_digest"), str) or not claims["job_drive_digest"]:
+            return "supervisor receipt lacks a job-drive digest"
+        for name in ("wall_time_ms", "cpu_time_ms", "memory_peak_bytes"):
+            if not isinstance(claims.get(name), int) or claims[name] < 0:
+                return "supervisor receipt has invalid resource measurements"
+        if not isinstance(claims.get("timed_out"), bool) or not isinstance(claims.get("oom_killed"), bool):
+            return "supervisor receipt lacks timeout/OOM attestations"
+        if result.success and (claims["timed_out"] or claims["oom_killed"]):
+            return "successful guest result conflicts with timeout/OOM attestation"
         return None

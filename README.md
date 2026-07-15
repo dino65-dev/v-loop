@@ -72,7 +72,14 @@ required deployment gate: it requires a `CapabilityEnforcingExecutor` over a
 Firecracker executor, SQLite nonce/idempotency/policy-budget stores,
 policy-bound schema-v2 signed receipts for every contract-required verifier,
 `StructuralVerifier`, a final verifier, non-empty protected probes, a signed
-approval verifier, and a policy-bound Firecracker supervisor receipt.
+approval verifier, a policy-bound Firecracker supervisor receipt, durable
+SQLite controller state, and authenticated remote supervisor/ledger-anchor
+clients. Production contracts must use closed argument schemas and require a
+value-bound provenance DAG for every argument.
+`build()` returns an immutable `ProductionRuntime`, not the builder itself.
+The runtime re-validates the contract digest, verifier requirements, closed
+argument schemas, key trust, and receipt policies before constructing a loop,
+so later mutation of a component cannot silently broaden the deployed gate.
 
 Use BubblewrapExecutor (or another separately deployed executor) with separate
 credentials, read-only evaluator assets, constrained mounts, no network unless
@@ -96,11 +103,19 @@ manifest and primary artifact, job/manifest, fresh drive, and destruction
 attestation. This is intentional; the controller never holds KVM or jailer
 authority.
 
-The repository does not provide a privileged Firecracker supervisor, evaluator
-service, external ledger anchor, or durable controller orchestrator. Those are
-separate deployment services with distinct credentials. The production builder
-prevents a local substitute from being labelled production, but it cannot
-create or operate those services on the deployer's behalf.
+The repository provides narrow signed HTTPS clients and durable outboxes for a
+privileged Firecracker supervisor, protected evaluator, and external ledger
+anchor. It does not provide or operate those privileged services: deployment
+must run them with distinct credentials, deduplicate the supplied job/head ID,
+and sign the separately trusted receipts. The production builder rejects an
+in-process supervisor or absent remote-service client.
+
+`CanonicalWorkspaceSnapshotter` creates deterministic, schema-versioned
+workspace snapshots that bind the source tree, dependency-lock digests,
+toolchain, environment, Git state, and an explicit exclusion policy. Production
+receipts use this snapshot rather than a caller-supplied source digest. The
+deployment must snapshot an immutable copy or read-only mount; a snapshotter
+cannot itself prevent a source tree from changing after it has been read.
 
 ## Quick start
 
@@ -129,6 +144,11 @@ metadata is never used for final completion.
 Production systems can instead supply a separate end-to-end evaluator. A
 passing action report or neural diagnostic alone is never enough to complete a
 task.
+
+An action report may still make safe criterion progress when its structural and
+hard checks pass but other task criteria are incomplete. This lets multi-step
+tasks accumulate independent evidence without treating an incomplete action as
+globally accepted; any failed hard check remains a repair path.
 
 ## Neural verifier
 
@@ -178,16 +198,37 @@ subset of the server-owned ToolAuthority catalog. A model may draft the
 request, but cannot broaden a path, remove an approval requirement, or modify
 the forbidden-action list.
 
+For deployment, construct the compiler from a server-owned `TaskProfile`.
+Profiles bind a task kind to tool authorities, required verifier categories,
+named check bindings for every success condition, probe policy, risk class,
+and the mandatory per-argument provenance requirement.
+This makes the generated contract suitable for the production runtime gate;
+the client request may only select a subset of those predeclared conditions.
+
+## Approval and key trust
+
+High-impact actions use signed approvals bound to the exact intent digest,
+contract digest, and executor identity. Approval verification uses a
+verifier-owned approver trust entry with role, validity, and revocation data,
+plus a durable single-use consumption store. Receipt verification similarly
+uses verifier-owned receipt-key trust entries, bounded receipt age/TTL, allowed
+receipt types and evaluator images. A receipt's self-asserted revocation epoch
+is retained only for audit; it is not a trust decision.
+
 ## Context and state
 
 ContextEngine packages repository facts, tool observations, and verified memory
 as provenance-labelled data under a fixed context budget. Memory conditions,
 source run, confidence, expiry, and supersession metadata remain visible to the
 planner. `OpenAICompatiblePlanner.propose_with_context` passes trusted and
-untrusted material in separate data blocks, while runtime code—not model JSON—
-assigns action provenance. Untrusted retrieval is conservatively propagated to
-PolicyGate when a controller context provider is configured. The immutable
-contract remains outside this package.
+untrusted material in separate data blocks. For production contracts, runtime
+code—not model JSON—binds every concrete argument to a DAG of source IDs and
+content digests, including a conservative derivation edge from all supplied
+context. `PolicyGate` rejects any missing or value-mismatched graph. Untrusted
+retrieval is therefore propagated at argument granularity. `SQLiteRunStateStore`
+persists verified history and final-goal evidence between iterations. It resumes
+only a safe checkpoint; a crash after the pre-effect checkpoint becomes
+`waiting` for supervisor/operator reconciliation and is never replayed.
 
 ## Verified memory
 
@@ -198,6 +239,15 @@ supersession before querying a hot
 index. External LightRAG and HippoRAG adapters return only memory IDs; the
 ledger rehydrates and filters them, so an external index cannot inject a claim
 or bypass memory-write verification.
+
+`MemoryClaimAuthority` adds a server-owned claim-kind/schema gate before a
+claim becomes reusable. `MemoryLedger` writes canonical records and a
+per-projection transactional outbox in the same SQLite transaction.
+`MemoryProjectionWorker` delivers idempotent, at-least-once upserts to concrete
+`LightRAGIndex` or `HippoRAGIndex` adapters; restricted records are excluded by
+default. `EvidenceLedger` likewise enqueues each immutable head in an anchor
+outbox, and `LedgerAnchorWorker` publishes it through the authenticated anchor
+client. Neither external service can write into a canonical ledger.
 
 VerifiedMemoryCommitter wires this gate into a completed controller run: it
 requires a passing final-goal receipt and verifies that every memory citation is

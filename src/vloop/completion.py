@@ -81,6 +81,14 @@ class EvidenceAccumulator:
     def snapshot(self) -> EvidenceSnapshot:
         return EvidenceSnapshot(self._run_id, tuple(self._actions))
 
+    @classmethod
+    def from_snapshot(cls, snapshot: EvidenceSnapshot) -> "EvidenceAccumulator":
+        """Restore only already-verified action evidence from a checkpoint."""
+
+        accumulator = cls(snapshot.run_id)
+        accumulator._actions = list(snapshot.actions)
+        return accumulator
+
 
 class FinalVerifier(Protocol):
     """Protected evaluator for whole-task completion."""
@@ -106,6 +114,16 @@ class RequiredChecksFinalVerifier:
 
     def __init__(self, required_checks: Mapping[str, tuple[str, ...]]) -> None:
         self._required_checks = {condition: tuple(names) for condition, names in required_checks.items()}
+
+    @property
+    def required_checks(self) -> Mapping[str, tuple[str, ...]]:
+        return dict(self._required_checks)
+
+    @classmethod
+    def from_contract(cls, contract: TaskContract) -> "RequiredChecksFinalVerifier":
+        if not contract.success_condition_bindings:
+            raise ValueError("contract has no immutable success-condition bindings")
+        return cls(contract.success_condition_bindings)
 
     def verify(
         self,

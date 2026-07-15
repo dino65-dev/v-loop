@@ -5,11 +5,52 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 from .canonical import canonical_json, digest
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerAnchorRecord:
+    """One immutable evidence-ledger head eligible for external anchoring."""
+
+    event_hash: str
+    sequence: int
+    occurred_at: datetime
+    attempts: int
+
+
+class LedgerAnchor(Protocol):
+    """Externally operated append-only anchor service."""
+
+    name: str
+
+    def anchor(self, record: LedgerAnchorRecord) -> None: ...
+
+
+class LedgerAnchorWorker:
+    """Durably publishes evidence heads; replay must be idempotent by hash."""
+
+    def __init__(self, ledger: "EvidenceLedger", anchor: LedgerAnchor, *, worker_id: str) -> None:
+        if not worker_id.strip():
+            raise ValueError("ledger anchor worker needs a stable worker id")
+        self.ledger = ledger
+        self.anchor = anchor
+        self.worker_id = worker_id
+
+    def drain(self, *, limit: int = 20) -> int:
+        delivered = 0
+        for record in self.ledger.claim_anchor_operations(worker_id=self.worker_id, limit=limit):
+            try:
+                self.anchor.anchor(record)
+                self.ledger.complete_anchor_operation(record.event_hash, worker_id=self.worker_id)
+                delivered += 1
+            except Exception as exc:
+                self.ledger.release_anchor_operation(record.event_hash, worker_id=self.worker_id, error=exc)
+        return delivered
 
 
 class EvidenceLedger:
@@ -50,6 +91,21 @@ class EvidenceLedger:
         )
         self._connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS ledger_anchor_outbox (
+                event_hash TEXT PRIMARY KEY,
+                sequence INTEGER NOT NULL,
+                occurred_at TEXT NOT NULL,
+                state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                last_error TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS ledger_head (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 event_hash TEXT NOT NULL
@@ -83,7 +139,7 @@ class EvidenceLedger:
                     "parent_hash": parent_hash,
                 }
             )
-            self._connection.execute(
+            cursor = self._connection.execute(
                 """
                 INSERT INTO ledger_events
                     (event_type, occurred_at, payload, parent_hash, event_hash)
@@ -91,17 +147,94 @@ class EvidenceLedger:
                 """,
                 (event_type, occurred_at, serialized, parent_hash, event_hash),
             )
+            sequence = cursor.lastrowid
             cursor = self._connection.execute(
                 "UPDATE ledger_head SET event_hash = ? WHERE singleton = 1 AND event_hash = ?",
                 (event_hash, parent_hash),
             )
             if cursor.rowcount != 1:  # pragma: no cover - BEGIN IMMEDIATE serializes writers
                 raise RuntimeError("ledger head changed during append")
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO ledger_anchor_outbox
+                (event_hash, sequence, occurred_at, state, attempts, lease_owner,
+                 lease_expires_at, last_error, updated_at)
+                VALUES (?, ?, ?, 'pending', 0, NULL, NULL, NULL, ?)
+                """,
+                (event_hash, sequence, occurred_at, occurred_at),
+            )
             self._connection.execute("COMMIT")
         except Exception:
             self._connection.execute("ROLLBACK")
             raise
         return event_hash
+
+    def claim_anchor_operations(
+        self,
+        *,
+        worker_id: str,
+        limit: int = 20,
+        lease_seconds: int = 120,
+    ) -> list["LedgerAnchorRecord"]:
+        if not worker_id.strip() or limit < 1 or lease_seconds < 1:
+            raise ValueError("invalid ledger anchor lease request")
+        now = datetime.now(UTC)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self._connection.execute(
+                """
+                SELECT event_hash, sequence, occurred_at, attempts
+                FROM ledger_anchor_outbox
+                WHERE state = 'pending' OR (state = 'leased' AND lease_expires_at <= ?)
+                ORDER BY sequence LIMIT ?
+                """,
+                (now.isoformat(), limit),
+            ).fetchall()
+            expires_at = datetime.fromtimestamp(now.timestamp() + lease_seconds, UTC).isoformat()
+            for event_hash, _sequence, _occurred_at, _attempts in rows:
+                self._connection.execute(
+                    """
+                    UPDATE ledger_anchor_outbox
+                    SET state = 'leased', attempts = attempts + 1, lease_owner = ?,
+                        lease_expires_at = ?, updated_at = ?
+                    WHERE event_hash = ?
+                    """,
+                    (worker_id, expires_at, now.isoformat(), event_hash),
+                )
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+        return [
+            LedgerAnchorRecord(event_hash, int(sequence), datetime.fromisoformat(occurred_at), int(attempts) + 1)
+            for event_hash, sequence, occurred_at, attempts in rows
+        ]
+
+    def complete_anchor_operation(self, event_hash: str, *, worker_id: str) -> None:
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE ledger_anchor_outbox
+                SET state = 'delivered', lease_owner = NULL, lease_expires_at = NULL,
+                    last_error = NULL, updated_at = ?
+                WHERE event_hash = ? AND state = 'leased' AND lease_owner = ?
+                """,
+                (datetime.now(UTC).isoformat(), event_hash, worker_id),
+            )
+        if cursor.rowcount != 1:
+            raise RuntimeError("ledger anchor outbox lease was lost")
+
+    def release_anchor_operation(self, event_hash: str, *, worker_id: str, error: Exception) -> None:
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE ledger_anchor_outbox
+                SET state = 'pending', lease_owner = NULL, lease_expires_at = NULL,
+                    last_error = ?, updated_at = ?
+                WHERE event_hash = ? AND state = 'leased' AND lease_owner = ?
+                """,
+                (type(error).__name__, datetime.now(UTC).isoformat(), event_hash, worker_id),
+            )
 
     def events(self) -> list[dict[str, Any]]:
         rows = self._connection.execute(

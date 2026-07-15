@@ -54,6 +54,7 @@ class ReceiptPolicy:
     minimum_schema_version: int = 2
     minimum_revocation_epoch: int = 0
     required_contract_digest: str | None = None
+    workspace_snapshot_schema: str | None = None
 
     def __post_init__(self) -> None:
         if not self.receipt_type.strip():
@@ -62,6 +63,8 @@ class ReceiptPolicy:
             raise ValueError("production receipt policies require schema v2 or newer")
         if self.minimum_revocation_epoch < 0:
             raise ValueError("revocation epoch cannot be negative")
+        if self.workspace_snapshot_schema is not None and not self.workspace_snapshot_schema.strip():
+            raise ValueError("workspace snapshot schema cannot be blank")
         for values, label in (
             (self.allowed_key_ids, "key ids"),
             (self.allowed_evaluator_images, "evaluator images"),
@@ -81,8 +84,29 @@ class ReceiptPolicy:
                 "minimum_schema_version": self.minimum_schema_version,
                 "minimum_revocation_epoch": self.minimum_revocation_epoch,
                 "required_contract_digest": self.required_contract_digest,
+                "workspace_snapshot_schema": self.workspace_snapshot_schema,
             }
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiptKeyTrustEntry:
+    """Verifier-owned lifecycle and scope for one evaluator signing key."""
+
+    key_id: str
+    valid_from: datetime
+    valid_until: datetime
+    receipt_types: frozenset[str]
+    evaluator_images: frozenset[str]
+    revoked_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.key_id.strip() or not self.receipt_types or not self.evaluator_images:
+            raise ValueError("receipt key trust needs key id, receipt types, and evaluator images")
+        if self.valid_from.tzinfo is None or self.valid_until.tzinfo is None or self.valid_until <= self.valid_from:
+            raise ValueError("receipt key trust interval is invalid")
+        if self.revoked_at is not None and self.revoked_at.tzinfo is None:
+            raise ValueError("receipt revocation time must be timezone-aware")
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +309,7 @@ class ReceiptSigner:
         toolchain_digest: str = "",
         environment_digest: str = "",
         verifier_policy_digest: str = "",
+        workspace_snapshot: Any | None = None,
         revocation_epoch: int = 0,
         claims: Mapping[str, Any] | None = None,
         ttl: timedelta = timedelta(minutes=10),
@@ -292,6 +317,25 @@ class ReceiptSigner:
         schema_version: int = 2,
     ) -> EvaluationReceipt:
         issued_at = now or datetime.now(UTC)
+        claims_payload = dict(claims or {})
+        if workspace_snapshot is not None:
+            required_attributes = (
+                "schema_version",
+                "workspace_snapshot_digest",
+                "dependency_lock_digest",
+                "toolchain_digest",
+                "environment_digest",
+            )
+            if any(not isinstance(getattr(workspace_snapshot, name, None), str) or not getattr(workspace_snapshot, name) for name in required_attributes):
+                raise ValueError("workspace snapshot is not canonical snapshot data")
+            if workspace_snapshot_digest and workspace_snapshot_digest != workspace_snapshot.workspace_snapshot_digest:
+                raise ValueError("workspace snapshot digest conflicts with canonical snapshot")
+            workspace_snapshot_digest = workspace_snapshot.workspace_snapshot_digest
+            dependency_lock_digest = workspace_snapshot.dependency_lock_digest
+            toolchain_digest = workspace_snapshot.toolchain_digest
+            environment_digest = workspace_snapshot.environment_digest
+            claims_payload["workspace_snapshot_schema"] = workspace_snapshot.schema_version
+            claims_payload["workspace_snapshot_exclusion_policy_digest"] = workspace_snapshot.exclusion_policy_digest
         manifest_digest = ""
         primary_digest = ""
         if schema_version >= 2:
@@ -315,7 +359,7 @@ class ReceiptSigner:
             nonce=str(uuid4()),
             issued_at=issued_at,
             expires_at=issued_at + ttl,
-            claims=dict(claims or {}),
+            claims=claims_payload,
             schema_version=schema_version,
             key_id=self._key_id,
             contract_digest=contract_digest,
@@ -344,6 +388,10 @@ class ReceiptVerifier:
         *,
         policy: ReceiptPolicy | None = None,
         key_id: str = "default",
+        trust_entries: Mapping[str, ReceiptKeyTrustEntry] | None = None,
+        maximum_ttl: timedelta = timedelta(minutes=15),
+        maximum_age: timedelta = timedelta(minutes=15),
+        clock_skew: timedelta = timedelta(seconds=30),
     ) -> None:
         if isinstance(public_key, Mapping):
             self._keys = {
@@ -357,8 +405,18 @@ class ReceiptVerifier:
         if not self._keys or any(not name.strip() for name in self._keys):
             raise ValueError("receipt verifier needs keyed public verification material")
         self.policy = policy
+        self._trust_entries = dict(trust_entries or {})
+        if self._trust_entries and set(self._trust_entries) != set(self._keys):
+            raise ValueError("receipt trust entries must cover exactly the configured keys")
+        self._maximum_ttl = maximum_ttl
+        self._maximum_age = maximum_age
+        self._clock_skew = clock_skew
         if policy is not None and policy.allowed_key_ids.difference(self._keys):
             raise ValueError("receipt policy names keys unavailable to this verifier")
+
+    @property
+    def has_verifier_owned_trust(self) -> bool:
+        return bool(self._trust_entries)
 
     def validate(
         self,
@@ -376,7 +434,12 @@ class ReceiptVerifier:
             raise ReceiptRejected("receipt type does not match verifier")
         if receipt.run_id != run_id or receipt.intent_digest != intent_digest:
             raise ReceiptRejected("receipt is not bound to this run and intent")
-        if receipt.expires_at <= current or receipt.issued_at > current:
+        if (
+            receipt.expires_at <= current
+            or receipt.issued_at > current + self._clock_skew
+            or current - receipt.issued_at > self._maximum_age
+            or receipt.expires_at - receipt.issued_at > self._maximum_ttl
+        ):
             raise ReceiptRejected("receipt is expired or not yet valid")
         key = self._keys.get(receipt.key_id)
         if key is None:
@@ -386,6 +449,17 @@ class ReceiptVerifier:
             key.verify(signature, receipt.payload())
         except (InvalidSignature, ValueError) as exc:
             raise ReceiptRejected("invalid receipt signature") from exc
+
+        trust = self._trust_entries.get(receipt.key_id)
+        if trust is not None:
+            if current < trust.valid_from or current >= trust.valid_until or (
+                trust.revoked_at is not None and current >= trust.revoked_at
+            ):
+                raise ReceiptRejected("receipt signing key is not currently trusted")
+            if receipt.receipt_type not in trust.receipt_types:
+                raise ReceiptRejected("receipt type is not authorized for this signing key")
+            if receipt.evaluator_image_digest not in trust.evaluator_images:
+                raise ReceiptRejected("evaluator identity is not authorized for this signing key")
 
         if self.policy is not None:
             if receipt.receipt_type != self.policy.receipt_type:
@@ -398,10 +472,16 @@ class ReceiptVerifier:
                 raise ReceiptRejected("evaluator image is not allowed by policy")
             if receipt.test_suite_digest not in self.policy.allowed_test_suites:
                 raise ReceiptRejected("test suite is not allowed by policy")
-            if receipt.revocation_epoch < self.policy.minimum_revocation_epoch:
-                raise ReceiptRejected("receipt key has been revoked")
+            # ``revocation_epoch`` is retained for audit compatibility only.
+            # Revocation is determined from the verifier-owned trust entry;
+            # a compromised signer can otherwise mint any epoch it chooses.
             if receipt.verifier_policy_digest != self.policy.policy_digest:
                 raise ReceiptRejected("receipt is bound to a different evaluator policy")
+            if (
+                self.policy.workspace_snapshot_schema is not None
+                and receipt.claims.get("workspace_snapshot_schema") != self.policy.workspace_snapshot_schema
+            ):
+                raise ReceiptRejected("receipt was not generated by the required canonical snapshot service")
 
         expected_contract = contract_digest or (self.policy.required_contract_digest if self.policy else None)
         if expected_contract is not None and receipt.contract_digest != expected_contract:

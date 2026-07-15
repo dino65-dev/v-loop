@@ -8,13 +8,15 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from vloop.completion import EvidenceAccumulator, RequiredChecksFinalVerifier
+from vloop.completion import CallableFinalVerifier, EvidenceAccumulator, RequiredChecksFinalVerifier
+from vloop.canonical import digest
 from vloop.authorization import CapabilityVerifier, InMemoryNonceStore, SQLiteNonceStore
 from vloop.controller import VerifiedLoop
 from vloop.contract_compiler import (
     ContractCompilationError,
     ContractRequest,
     RequestedAction,
+    TaskProfile,
     TaskContractCompiler,
     ToolAuthority,
 )
@@ -38,7 +40,7 @@ from vloop.firecracker import (
     GuestExecutionResult,
     MicroVMResources,
 )
-from vloop.ledger import EvidenceLedger
+from vloop.ledger import EvidenceLedger, LedgerAnchorWorker
 from vloop.learning import (
     EvaluationSlice,
     ModelCandidate,
@@ -53,7 +55,12 @@ from vloop.memory import (
 )
 from vloop.memory import (
     ExternalMemoryIndex,
+    HippoRAGIndex,
+    LightRAGIndex,
+    MemoryClaimAuthority,
+    MemoryClaimRule,
     MemoryLedger,
+    MemoryProjectionWorker,
     MemoryQuery,
     MemoryService,
     WorkingState,
@@ -62,6 +69,8 @@ from vloop.memory import (
 from vloop.models import (
     ActionIntent,
     ActionRule,
+    ArgumentProvenance,
+    ArgumentProvenanceNode,
     ArgumentKind,
     ArgumentRule,
     CheckResult,
@@ -78,15 +87,25 @@ from vloop.neural_verifier import OpenAICompatibleDiagnosticBackend
 from vloop.policy import (
     Approval,
     ApprovalSigner,
+    ApprovalTrustEntry,
     ApprovalVerifier,
     PolicyDenied,
     PolicyGate,
     SQLitePolicyUseCounterStore,
+    SQLiteApprovalConsumptionStore,
 )
 from vloop.probes import CallableProbe, ProbeDefinition, ProbeKind, ProtectedProbeRunner
-from vloop.receipts import ReceiptPolicy, ReceiptSigner, ReceiptVerifier
+from vloop.receipts import ReceiptKeyTrustEntry, ReceiptPolicy, ReceiptSigner, ReceiptVerifier
+from vloop.snapshot import CanonicalWorkspaceSnapshotter, SNAPSHOT_SCHEMA
 from vloop.repair import RepairController
 from vloop.runtime import ProductionConfigurationError, ProductionRuntimeBuilder
+from vloop.run_state import RunPhase, SQLiteRunStateStore
+from vloop.services import (
+    AuthenticatedHTTPSClient,
+    FirecrackerSupervisorHTTPClient,
+    LedgerAnchorHTTPClient,
+    ServiceRequestSigner,
+)
 from vloop.verifiers import (
     BenchmarkEvidenceVerifier,
     CallableVerifier,
@@ -603,6 +622,64 @@ def test_contract_compiler_uses_most_restrictive_overlapping_authority() -> None
     assert rule.approval_required and rule.max_uses == 2
 
 
+def test_task_profile_compiles_immutable_production_verifier_requirements() -> None:
+    profile = TaskProfile(
+        "bounded-command",
+        (
+            ToolAuthority(
+                "command.run",
+                Effect.EXECUTE,
+                ("/workspace",),
+                argument_rules=(ArgumentRule("command", ArgumentKind.ARGV, required=True),),
+            ),
+        ),
+        {
+            "correctness": ("differential",),
+            "policy": ("isolation",),
+            "evidence": ("artifacts",),
+            "quality": ("benchmark",),
+        },
+        {"command passes": ("differential", "isolation", "artifacts", "benchmark")},
+        "held-out-command-probes-v1",
+        "high",
+    )
+    compiled = TaskContractCompiler(profile=profile).compile(
+        ContractRequest(
+            "run bounded command",
+            ("command passes",),
+            (RequestedAction("command.run", Effect.EXECUTE, "/workspace/tests"),),
+        )
+    )
+    assert compiled.required_verifiers == profile.required_verifiers
+    assert compiled.success_condition_bindings == profile.success_condition_bindings
+    assert not compiled.allowed_actions[0].allow_unlisted_arguments
+
+
+def test_closed_authority_argument_schemas_intersect_not_union() -> None:
+    compiler = TaskContractCompiler(
+        (
+            ToolAuthority(
+                "command.run", Effect.EXECUTE, ("/workspace",),
+                argument_rules=(ArgumentRule("command", ArgumentKind.ARGV, required=True),),
+            ),
+            ToolAuthority(
+                "command.run", Effect.EXECUTE, ("/workspace",),
+                argument_rules=(
+                    ArgumentRule("command", ArgumentKind.ARGV, required=True),
+                    ArgumentRule("network", ArgumentKind.BOOLEAN),
+                ),
+            ),
+        )
+    )
+    compiled = compiler.compile(
+        ContractRequest(
+            "run command", ("command passes",),
+            (RequestedAction("command.run", Effect.EXECUTE, "/workspace/tests"),),
+        )
+    )
+    assert tuple(rule.name for rule in compiled.allowed_actions[0].argument_rules) == ("command",)
+
+
 def test_bazaarlink_deepseek_is_default_without_persisting_a_key() -> None:
     backend = OpenAICompatibleDiagnosticBackend(api_key="test-key")
     assert backend.base_url == "https://bazaarlink.ai/api/v1"
@@ -985,17 +1062,52 @@ def test_policy_requires_signed_expiring_approval_when_configured() -> None:
     )
     with pytest.raises(PolicyDenied, match="requires explicit approval"):
         gate.authorize(action, executor_id="test-executor", approvals=(Approval(action.intent_digest, "reviewer", datetime.now(UTC)),))
-    receipt = signer.approve(intent=action, contract=task, approver="reviewer")
+    receipt = signer.approve(
+        intent=action, contract=task, approver="reviewer", executor_id="test-executor"
+    )
     assert gate.authorize(action, executor_id="test-executor", approvals=(receipt,)).intent_digest == action.intent_digest
     expired = signer.approve(
         intent=action,
         contract=task,
         approver="reviewer",
+        executor_id="test-executor",
         now=datetime.now(UTC) - timedelta(minutes=20),
         ttl=timedelta(minutes=1),
     )
     with pytest.raises(PolicyDenied, match="requires explicit approval"):
         gate.authorize(action, executor_id="test-executor", approvals=(expired,))
+
+
+def test_signed_approval_is_key_bound_executor_bound_and_single_use(tmp_path: Path) -> None:
+    task = TaskContract(
+        "publish reviewed artifact",
+        ("artifact published",),
+        (ActionRule("file.write", Effect.WRITE, "/workspace", approval_required=True),),
+    )
+    action = ActionIntent(
+        "file.write", Effect.WRITE, "/workspace/report.txt", {"content": "reviewed"},
+        (Provenance.USER,), "write reviewed artifact", task.contract_id, task.version,
+    )
+    signer = ApprovalSigner(b"j" * 32, key_id="alice-key")
+    verifier = ApprovalVerifier(
+        {"alice-key": signer.public_key_bytes},
+        trust_entries={
+            "alice-key": ApprovalTrustEntry(
+                "alice-key", "alice@example.com", frozenset({"security-reviewer"}),
+                datetime(2020, 1, 1, tzinfo=UTC), datetime(2030, 1, 1, tzinfo=UTC),
+            )
+        },
+        consumption_store=SQLiteApprovalConsumptionStore(tmp_path / "approvals.db"),
+    )
+    gate = PolicyGate(task, signing_key=b"l" * 32, approval_verifier=verifier)
+    receipt = signer.approve(
+        intent=action, contract=task, approver="alice@example.com", executor_id="executor-a"
+    )
+    with pytest.raises(PolicyDenied, match="requires explicit approval"):
+        gate.authorize(action, executor_id="executor-b", approvals=(receipt,))
+    assert gate.authorize(action, executor_id="executor-a", approvals=(receipt,)).intent_digest == action.intent_digest
+    with pytest.raises(PolicyDenied, match="requires explicit approval"):
+        gate.authorize(action, executor_id="executor-a", approvals=(receipt,))
 
 
 def test_policy_use_budget_is_durable_across_gate_restart(tmp_path: Path) -> None:
@@ -1198,6 +1310,75 @@ def test_signed_receipt_binds_evaluator_claim_to_run_intent_and_artifact() -> No
     assert verifier.verify(task, substituted, run_id="run-1", intent=action).correctness is CheckStatus.FAIL
 
 
+def test_canonical_workspace_snapshot_is_bound_into_signed_receipt(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "program.py").write_text("print('ok')\n")
+    (workspace / "uv.lock").write_text("lock-v1\n")
+    snapshotter = CanonicalWorkspaceSnapshotter()
+    first = snapshotter.snapshot(
+        workspace,
+        dependency_locks=("uv.lock",),
+        toolchain_digest="toolchain-sha",
+        environment_digest="environment-sha",
+    )
+    (workspace / "program.py").write_text("print('changed')\n")
+    second = snapshotter.snapshot(
+        workspace,
+        dependency_locks=("uv.lock",),
+        toolchain_digest="toolchain-sha",
+        environment_digest="environment-sha",
+    )
+    assert first.workspace_snapshot_digest != second.workspace_snapshot_digest
+    task = contract()
+    action = intent(task)
+    signer = ReceiptSigner(b"q" * 32, key_id="snapshot-evaluator")
+    policy = ReceiptPolicy(
+        "snapshot-check",
+        frozenset({"snapshot-evaluator"}),
+        frozenset({"snapshot-image"}),
+        frozenset({"snapshot-suite"}),
+        workspace_snapshot_schema=SNAPSHOT_SCHEMA,
+    )
+    artifacts = {"program": "artifact-sha"}
+    receipt = signer.issue(
+        receipt_type="snapshot-check",
+        run_id="run-snapshot",
+        intent_digest=action.intent_digest,
+        candidate_artifact_digest="artifact-sha",
+        evaluator_image_digest="snapshot-image",
+        test_suite_digest="snapshot-suite",
+        result="pass",
+        contract_digest=task.contract_digest,
+        artifact_digests=artifacts,
+        primary_artifact_name="program",
+        verifier_policy_digest=policy.policy_digest,
+        workspace_snapshot=first,
+    )
+    verifier = ReceiptVerifier(
+        signer.public_key_bytes,
+        key_id=signer.key_id,
+        policy=policy,
+        trust_entries={
+            signer.key_id: ReceiptKeyTrustEntry(
+                signer.key_id,
+                datetime(2020, 1, 1, tzinfo=UTC),
+                datetime(2030, 1, 1, tzinfo=UTC),
+                frozenset({"snapshot-check"}),
+                frozenset({"snapshot-image"}),
+            )
+        },
+    )
+    verifier.validate(
+        receipt,
+        receipt_type="snapshot-check",
+        run_id="run-snapshot",
+        intent_digest=action.intent_digest,
+        artifact_digests=artifacts,
+        contract_digest=task.contract_digest,
+    )
+
+
 def test_final_verifier_uses_only_receipts_fresh_for_final_source_state() -> None:
     task = TaskContract(
         "build and test",
@@ -1280,6 +1461,74 @@ def test_final_verifier_uses_only_receipts_fresh_for_final_source_state() -> Non
     )
 
 
+def test_controller_accumulates_independent_criteria_without_repairing_safe_progress(tmp_path: Path) -> None:
+    task = TaskContract(
+        "compile and test",
+        ("compile and tests pass",),
+        (ActionRule("command.run", Effect.EXECUTE, "/workspace"),),
+        success_condition_bindings={"compile and tests pass": ("compile", "tests")},
+        maximum_iterations=2,
+    )
+
+    class TwoStepPlanner:
+        def __init__(self) -> None:
+            self.step = 0
+
+        def propose(self, *, contract: TaskContract, history: tuple[dict, ...]) -> ActionIntent:
+            del history
+            self.step += 1
+            return ActionIntent(
+                "command.run",
+                Effect.EXECUTE,
+                f"/workspace/{'compile' if self.step == 1 else 'tests'}",
+                {"command": ["/bin/true"]},
+                (Provenance.USER,),
+                "produce one independently verifiable criterion",
+                contract.contract_id,
+                contract.version,
+                idempotency_key=f"criterion-{self.step}",
+            )
+
+    class TwoStepExecutor:
+        executor_id = "two-step"
+
+        def execute(self, action, capability):
+            assert capability.executor_id == self.executor_id
+            return ExecutionObservation(True, 0, "", "", {"result": action.target})
+
+    def criterion(name: str, marker: str):
+        return CallableVerifier(
+            name,
+            "correctness",
+            lambda _contract, observation: (
+                CheckResult(
+                    name,
+                    CheckStatus.PASS,
+                    {
+                        "signed_receipt": True,
+                        "workspace_snapshot_digest": "same-workspace-state",
+                        "issued_at": "2026-01-01T00:00:00+00:00",
+                    },
+                )
+                if observation.artifact_digests["result"].endswith(marker)
+                else CheckResult(name, CheckStatus.INCONCLUSIVE, {})
+            ),
+        )
+
+    ledger = EvidenceLedger(tmp_path / "ledger.db")
+    loop = VerifiedLoop(
+        contract=task,
+        planner=TwoStepPlanner(),
+        gate=PolicyGate(task, signing_key=b"i" * 32),
+        executor=TwoStepExecutor(),
+        verifier=HybridVerifier([ExecutionVerifier(), criterion("compile", "compile"), criterion("tests", "tests")]),
+        ledger=ledger,
+        final_verifier=RequiredChecksFinalVerifier.from_contract(task),
+    )
+    assert loop.run() is LoopDecision.ACCEPT
+    assert len([event for event in ledger.events() if event["event_type"] == "criterion.progressed"]) == 1
+
+
 def test_successful_action_cannot_bypass_registered_adversarial_probe(tmp_path: Path) -> None:
     task = contract()
     probe_runner = ProtectedProbeRunner(
@@ -1317,6 +1566,8 @@ class SignedFirecrackerSupervisor:
 
     def run(self, launch):
         artifacts = {"result": "result-sha"}
+        stdout = "guest finished"
+        result_file_digest = "result-file-sha"
         receipt = self.signer.issue(
             receipt_type="firecracker-supervisor",
             run_id=launch.manifest["run_id"],
@@ -1338,17 +1589,30 @@ class SignedFirecrackerSupervisor:
                 "manifest_digest": launch.manifest_digest,
                 "fresh_job_drive": True,
                 "job_drive_destroyed": True,
+                "exit_code": 0,
+                "result_path": "/job/vloop-result.json",
+                "stdout_digest": digest(stdout),
+                "stderr_digest": digest(""),
+                "result_file_digest": result_file_digest,
+                "job_drive_digest": "destroyed-job-drive-sha",
+                "wall_time_ms": 10,
+                "cpu_time_ms": 8,
+                "memory_peak_bytes": 1_048_576,
+                "timed_out": False,
+                "oom_killed": False,
             },
         )
         return GuestExecutionResult(
             launch.manifest_digest,
             True,
             0,
-            "guest finished",
+            stdout,
             "",
             artifacts,
             "/job/vloop-result.json",
             receipt.as_mapping(),
+            result_file_digest,
+            {"wall_time_ms": 10, "cpu_time_ms": 8, "memory_peak_bytes": 1_048_576},
         )
 
 
@@ -1422,14 +1686,18 @@ def test_production_runtime_rejects_insecure_defaults_and_accepts_complete_recip
     task = TaskContract(
         "verify an isolated candidate",
         ("all protected checks pass",),
-        (ActionRule("command.run", Effect.EXECUTE, "/workspace"),),
+        (ActionRule("command.run", Effect.EXECUTE, "/workspace", allow_unlisted_arguments=False),),
         required_verifiers={
             "correctness": ("differential",),
             "policy": ("isolation",),
             "evidence": ("artifacts",),
             "quality": ("benchmark",),
         },
-    )
+            success_condition_bindings={
+                "all protected checks pass": ("differential", "isolation", "artifacts", "benchmark"),
+            },
+            require_argument_provenance=True,
+        )
     signer = ReceiptSigner(b"v" * 32, key_id="evaluator-2026")
 
     def signed(name: str, category: str, receipt_type: str) -> SignedReceiptVerifier:
@@ -1438,12 +1706,26 @@ def test_production_runtime_rejects_insecure_defaults_and_accepts_complete_recip
             frozenset({"evaluator-2026"}),
             frozenset({f"{receipt_type}-image"}),
             frozenset({f"{receipt_type}-suite"}),
+            workspace_snapshot_schema=SNAPSHOT_SCHEMA,
         )
         return SignedReceiptVerifier(
             name=name,
             category=category,
             receipt_type=receipt_type,
-            receipt_verifier=ReceiptVerifier(signer.public_key_bytes, key_id=signer.key_id, policy=policy),
+            receipt_verifier=ReceiptVerifier(
+                signer.public_key_bytes,
+                key_id=signer.key_id,
+                policy=policy,
+                trust_entries={
+                    signer.key_id: ReceiptKeyTrustEntry(
+                        signer.key_id,
+                        datetime(2020, 1, 1, tzinfo=UTC),
+                        datetime(2030, 1, 1, tzinfo=UTC),
+                        frozenset({receipt_type}),
+                        frozenset({f"{receipt_type}-image"}),
+                    )
+                },
+            ),
         )
 
     supervisor_policy = ReceiptPolicy(
@@ -1451,11 +1733,30 @@ def test_production_runtime_rejects_insecure_defaults_and_accepts_complete_recip
         frozenset({"evaluator-2026"}),
         frozenset({"supervisor-image"}),
         frozenset({"guest-policy"}),
+        workspace_snapshot_schema=SNAPSHOT_SCHEMA,
+    )
+    service_client = AuthenticatedHTTPSClient(
+        "http://127.0.0.1:9443",
+        ServiceRequestSigner(b"s" * 32, key_id="controller-service-2026"),
+        allow_insecure_loopback=True,
     )
     raw = FirecrackerExecutor(
         FirecrackerJobBuilder(FirecrackerAssets(kernel, rootfs, drive)),
-        NeverRunFirecrackerSupervisor(),
-        ReceiptVerifier(signer.public_key_bytes, key_id=signer.key_id, policy=supervisor_policy),
+        FirecrackerSupervisorHTTPClient(service_client),
+        ReceiptVerifier(
+            signer.public_key_bytes,
+            key_id=signer.key_id,
+            policy=supervisor_policy,
+            trust_entries={
+                signer.key_id: ReceiptKeyTrustEntry(
+                    signer.key_id,
+                    datetime(2020, 1, 1, tzinfo=UTC),
+                    datetime(2030, 1, 1, tzinfo=UTC),
+                    frozenset({"firecracker-supervisor"}),
+                    frozenset({"supervisor-image"}),
+                )
+            },
+        ),
     )
     gate = PolicyGate(task, signing_key=b"w" * 32)
     executor = CapabilityEnforcingExecutor(
@@ -1477,7 +1778,17 @@ def test_production_runtime_rejects_insecure_defaults_and_accepts_complete_recip
         task,
         signing_key=b"w" * 32,
         approval_verifier=ApprovalVerifier(
-            {"approver-2026": approval_signer.public_key_bytes}, allowed_approvers=frozenset({"security-reviewer"})
+            {"approver-2026": approval_signer.public_key_bytes},
+            trust_entries={
+                "approver-2026": ApprovalTrustEntry(
+                    "approver-2026",
+                    "security-reviewer",
+                    frozenset({"security-reviewer"}),
+                    datetime(2020, 1, 1, tzinfo=UTC),
+                    datetime(2030, 1, 1, tzinfo=UTC),
+                )
+            },
+            consumption_store=SQLiteApprovalConsumptionStore(tmp_path / "approval-consumption.db"),
         ),
         use_counter_store=SQLitePolicyUseCounterStore(tmp_path / "policy-counts.db"),
     )
@@ -1496,5 +1807,252 @@ def test_production_runtime_rejects_insecure_defaults_and_accepts_complete_recip
         RequiredChecksFinalVerifier({"all protected checks pass": ("differential", "isolation", "artifacts", "benchmark")} ),
         probe,
         production_gate,
+        SQLiteRunStateStore(tmp_path / "run-state.db"),
+        LedgerAnchorHTTPClient(service_client),
     )
-    assert builder.build() is builder
+    runtime = builder.build()
+    assert runtime.contract.contract_digest == task.contract_digest
+    with pytest.raises((AttributeError, TypeError)):
+        runtime.executor = Executor()
+    runtime.verifier._checks = (StructuralVerifier(),)
+    with pytest.raises(ProductionConfigurationError, match="required"):
+        runtime.validate()
+
+
+def test_argument_provenance_dag_is_value_bound_and_required_by_policy() -> None:
+    task = replace(contract(), require_argument_provenance=True)
+    gate = PolicyGate(task, signing_key=b"p" * 32)
+    unsigned = intent(task)
+    with pytest.raises(PolicyDenied, match="complete provenance DAG"):
+        gate.authorize(unsigned, executor_id="test-executor")
+
+    command = unsigned.arguments["command"]
+    source = ArgumentProvenanceNode(
+        "user-command",
+        Provenance.USER,
+        "ticket:123",
+        digest({"ticket": 123, "command": command}),
+    )
+    attested = replace(
+        unsigned,
+        argument_provenance_graph={
+            "command": ArgumentProvenance(digest(command), (source,))
+        },
+    )
+    assert gate.authorize(attested, executor_id="test-executor").intent_digest == attested.intent_digest
+    with pytest.raises(ValueError, match="bound to another value"):
+        replace(attested, arguments={"command": ["/bin/false"]})
+
+
+def test_controller_resumes_verified_progress_but_never_replays_a_pending_effect(tmp_path: Path) -> None:
+    task = contract()
+    ledger = EvidenceLedger(tmp_path / "ledger.db")
+    state = SQLiteRunStateStore(tmp_path / "state.db")
+
+    class StableVerifier:
+        def verify(self, *_args, **_kwargs):
+            return VerificationReport(
+                CheckStatus.PASS,
+                CheckStatus.PASS,
+                CheckStatus.PASS,
+                CheckStatus.PASS,
+                (
+                    CheckResult("execution", CheckStatus.PASS, {}),
+                    CheckResult("policy", CheckStatus.PASS, {}),
+                    CheckResult("evidence", CheckStatus.PASS, {}),
+                    CheckResult("quality", CheckStatus.PASS, {}),
+                ),
+            )
+
+    class CrashAfterFirstPlanner:
+        calls = 0
+
+        def propose(self, *, contract, history):
+            del history
+            self.calls += 1
+            if self.calls > 1:
+                raise RuntimeError("simulated controller crash after a safe checkpoint")
+            return intent(contract)
+
+    class HealthyPlanner:
+        def propose(self, *, contract, history):
+            del history
+            return intent(contract)
+
+    def final_after_two(_contract, _report, _history, evidence):
+        return CheckResult(
+            "final-goal",
+            CheckStatus.PASS if len(evidence.actions) >= 2 else CheckStatus.FAIL,
+            {},
+        )
+
+    run_id = "resumable-run"
+    first = VerifiedLoop(
+        contract=task,
+        planner=CrashAfterFirstPlanner(),
+        gate=PolicyGate(task, signing_key=b"r" * 32),
+        executor=Executor(),
+        verifier=StableVerifier(),
+        ledger=ledger,
+        final_verifier=CallableFinalVerifier(final_after_two),
+        state_store=state,
+        run_id=run_id,
+    )
+    with pytest.raises(RuntimeError, match="safe checkpoint"):
+        first.run()
+    checkpoint = state.load(run_id)
+    assert checkpoint is not None and checkpoint.phase is RunPhase.READY and checkpoint.next_iteration == 2
+
+    resumed = VerifiedLoop(
+        contract=task,
+        planner=HealthyPlanner(),
+        gate=PolicyGate(task, signing_key=b"r" * 32),
+        executor=Executor(),
+        verifier=StableVerifier(),
+        ledger=ledger,
+        final_verifier=CallableFinalVerifier(final_after_two),
+        state_store=state,
+        run_id=run_id,
+    )
+    assert resumed.run() is LoopDecision.ACCEPT
+
+    class CrashExecutor:
+        executor_id = "test-executor"
+
+        def execute(self, *_args):
+            raise RuntimeError("simulated crash while an effect may be in flight")
+
+    uncertain_run = "pending-effect-run"
+    uncertain = VerifiedLoop(
+        contract=task,
+        planner=HealthyPlanner(),
+        gate=PolicyGate(task, signing_key=b"t" * 32),
+        executor=CrashExecutor(),
+        verifier=StableVerifier(),
+        ledger=ledger,
+        final_verifier=CallableFinalVerifier(final_after_two),
+        state_store=state,
+        run_id=uncertain_run,
+    )
+    with pytest.raises(RuntimeError, match="in flight"):
+        uncertain.run()
+    calls = {"count": 0}
+
+    class NeverReplayExecutor:
+        executor_id = "test-executor"
+
+        def execute(self, *_args):
+            calls["count"] += 1
+            raise AssertionError("pending effects must not be replayed")
+
+    reconciler_wait = VerifiedLoop(
+        contract=task,
+        planner=HealthyPlanner(),
+        gate=PolicyGate(task, signing_key=b"t" * 32),
+        executor=NeverReplayExecutor(),
+        verifier=StableVerifier(),
+        ledger=ledger,
+        final_verifier=CallableFinalVerifier(final_after_two),
+        state_store=state,
+        run_id=uncertain_run,
+    )
+    assert reconciler_wait.run() is LoopDecision.WAITING
+    assert calls["count"] == 0
+
+
+def test_memory_projection_outbox_is_per_index_and_claims_have_server_schema(tmp_path: Path) -> None:
+    evidence = EvidenceLedger(tmp_path / "evidence.db")
+    authority = MemoryClaimAuthority(
+        [MemoryClaimRule("operational-procedure", frozenset({"v-loop"}), frozenset({"network"}))]
+    )
+    memory = MemoryLedger(tmp_path / "memory.db", evidence, claim_authority=authority)
+    accepted = VerificationReport(
+        CheckStatus.PASS, CheckStatus.PASS, CheckStatus.PASS, CheckStatus.PASS, ()
+    )
+    refs = (
+        evidence.append("execution.observed", {"run_id": "run"}),
+        evidence.append("final-goal.completed", {"run_id": "run", "status": "pass"}),
+    )
+    candidate = MemoryCandidate(
+        "Keep network disabled for untrusted jobs",
+        "v-loop",
+        {"network": "disabled"},
+        refs,
+        0.9,
+        "internal",
+    )
+    record = memory.insert(
+        MemoryWriteGate(authority).promote(candidate, accepted, source_run_id="run")
+    )
+
+    class Projection:
+        def __init__(self, name):
+            self.name = name
+            self.records = []
+
+        def upsert(self, item):
+            self.records.append(item.memory_id)
+
+    hot, associative = Projection("lightrag"), Projection("hipporag")
+    assert MemoryProjectionWorker(memory, hot, worker_id="hot-worker").drain() == 1
+    assert MemoryProjectionWorker(memory, associative, worker_id="assoc-worker").drain() == 1
+    assert hot.records == [record.memory_id] and associative.records == [record.memory_id]
+    assert MemoryProjectionWorker(memory, hot, worker_id="hot-worker").drain() == 0
+
+    with pytest.raises(PermissionError, match="claim kind"):
+        MemoryWriteGate(authority).promote(
+            replace(candidate, claim_kind="model-reflection"), accepted, source_run_id="run"
+        )
+
+
+def test_lightrag_hipporag_and_ledger_anchor_adapters_only_return_canonical_ids(tmp_path: Path) -> None:
+    evidence = EvidenceLedger(tmp_path / "evidence.db")
+    event_hash = evidence.append("test", {"run_id": "run"})
+
+    class Anchor:
+        name = "test-anchor"
+
+        def __init__(self):
+            self.hashes = []
+
+        def anchor(self, record):
+            self.hashes.append(record.event_hash)
+
+    anchor = Anchor()
+    assert LedgerAnchorWorker(evidence, anchor, worker_id="anchor-worker").drain() == 1
+    assert anchor.hashes == [event_hash]
+
+    from vloop.memory import MemoryRecord
+
+    external_record = MemoryRecord(
+        "12345678-1234-1234-1234-123456789abc",
+        "v-loop",
+        "sealed drive",
+        {"network": "disabled"},
+        (event_hash,),
+        0.9,
+        "internal",
+        "run",
+        datetime.now(UTC),
+        event_hash,
+    )
+
+    class HTTP:
+        def __init__(self):
+            self.inserted = []
+
+        def post(self, path, payload):
+            if path == "/insert":
+                self.inserted.append(payload["text"])
+                return {}
+            return {"context": self.inserted[0]}
+
+    http = HTTP()
+    light = LightRAGIndex(http)
+    light.upsert(external_record)
+    assert light.search(MemoryQuery("sealed drive", "v-loop"), [external_record])[0].record.memory_id == external_record.memory_id
+
+    ingested = []
+    hippo = HippoRAGIndex(lambda docs: ingested.extend(docs), lambda **_kwargs: ingested)
+    hippo.upsert(external_record)
+    assert hippo.search(MemoryQuery("sealed drive", "v-loop"), [external_record])[0].record.memory_id == external_record.memory_id

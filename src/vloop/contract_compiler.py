@@ -34,7 +34,28 @@ class ToolAuthority:
     approval_required: bool = False
     max_uses: int | None = None
     argument_rules: tuple[ArgumentRule, ...] = ()
-    allow_unlisted_arguments: bool = True
+    allow_unlisted_arguments: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TaskProfile:
+    """Reviewed server-owned production semantics for one task family."""
+
+    task_kind: str
+    tool_authorities: tuple[ToolAuthority, ...]
+    required_verifiers: Mapping[str, tuple[str, ...]]
+    success_condition_bindings: Mapping[str, tuple[str, ...]]
+    probe_policy_id: str
+    risk_class: str
+    require_argument_provenance: bool = True
+
+    def __post_init__(self) -> None:
+        if not all((self.task_kind, self.probe_policy_id, self.risk_class)):
+            raise ValueError("task profile needs kind, probe policy, and risk class")
+        if not self.tool_authorities or not self.required_verifiers or not self.success_condition_bindings:
+            raise ValueError("task profile needs authorities, verifier requirements, and success bindings")
+        if not isinstance(self.require_argument_provenance, bool):
+            raise ValueError("task profile provenance requirement must be a boolean")
 
 
 class ContractCompilationError(ValueError):
@@ -48,14 +69,28 @@ class TaskContractCompiler:
     remove an approval requirement, or grant a broader target prefix.
     """
 
-    def __init__(self, catalog: tuple[ToolAuthority, ...]) -> None:
-        self._catalog = catalog
+    def __init__(
+        self,
+        catalog: tuple[ToolAuthority, ...] = (),
+        *,
+        profile: TaskProfile | None = None,
+    ) -> None:
+        if profile is not None and catalog:
+            raise ValueError("provide a catalog or a task profile, not both")
+        self._profile = profile
+        self._catalog = profile.tool_authorities if profile is not None else catalog
+        if not self._catalog:
+            raise ValueError("contract compiler needs a server-owned authority catalog")
 
     def compile(self, request: ContractRequest) -> TaskContract:
         if not request.goal.strip():
             raise ContractCompilationError("goal is required")
         if not request.success_conditions:
             raise ContractCompilationError("at least one success condition is required")
+        if self._profile is not None and not set(request.success_conditions).issubset(
+            self._profile.success_condition_bindings
+        ):
+            raise ContractCompilationError("requested success condition is outside the reviewed task profile")
         rules: list[ActionRule] = []
         for action in request.requested_actions:
             authorities = self._resolve_all(action)
@@ -77,6 +112,15 @@ class TaskContractCompiler:
             success_conditions=request.success_conditions,
             allowed_actions=tuple(rules),
             forbidden_actions=("policy.update", "evaluator.modify", "memory.policy.write"),
+            required_verifiers=(dict(self._profile.required_verifiers) if self._profile else {}),
+            success_condition_bindings=(
+                {condition: tuple(self._profile.success_condition_bindings[condition]) for condition in request.success_conditions}
+                if self._profile
+                else {}
+            ),
+            require_argument_provenance=(
+                self._profile.require_argument_provenance if self._profile is not None else False
+            ),
             maximum_iterations=request.maximum_iterations,
             maximum_tool_calls=request.maximum_tool_calls,
         )
@@ -105,8 +149,16 @@ class TaskContractCompiler:
         """Keep every catalog constraint; PolicyGate applies all overlaps."""
 
         by_name: dict[str, list[ArgumentRule]] = {}
+        closed_authorities = [authority for authority in authorities if not authority.allow_unlisted_arguments]
+        closed_names = (
+            set.intersection(*[{rule.name for rule in authority.argument_rules} for authority in closed_authorities])
+            if closed_authorities
+            else None
+        )
         for authority in authorities:
             for rule in authority.argument_rules:
+                if closed_names is not None and rule.name not in closed_names:
+                    continue
                 by_name.setdefault(rule.name, []).append(rule)
         combined: list[ArgumentRule] = []
         for name, rules in sorted(by_name.items()):

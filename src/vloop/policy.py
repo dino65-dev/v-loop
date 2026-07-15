@@ -45,6 +45,81 @@ class ApprovalRejected(PermissionError):
 
 
 @dataclass(frozen=True, slots=True)
+class ApprovalTrustEntry:
+    """Verifier-owned binding from one signing key to one human principal."""
+
+    key_id: str
+    subject: str
+    roles: frozenset[str]
+    valid_from: datetime
+    valid_until: datetime
+    revoked_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.key_id.strip() or not self.subject.strip() or not self.roles:
+            raise ValueError("approval trust entry needs a key, subject, and roles")
+        if self.valid_from.tzinfo is None or self.valid_until.tzinfo is None:
+            raise ValueError("approval trust entry times must be timezone-aware")
+        if self.valid_until <= self.valid_from:
+            raise ValueError("approval trust interval is invalid")
+        if self.revoked_at is not None and self.revoked_at.tzinfo is None:
+            raise ValueError("approval revocation time must be timezone-aware")
+
+
+class ApprovalConsumptionStore:
+    def consume(self, approval_id: str, *, intent_digest: str, executor_id: str) -> bool: ...
+
+
+class InMemoryApprovalConsumptionStore:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._consumed: set[tuple[str, str, str]] = set()
+
+    def consume(self, approval_id: str, *, intent_digest: str, executor_id: str) -> bool:
+        key = (approval_id, intent_digest, executor_id)
+        with self._lock:
+            if key in self._consumed:
+                return False
+            self._consumed.add(key)
+            return True
+
+
+class SQLiteApprovalConsumptionStore:
+    """Durable one-time approval consumption at the policy decision point."""
+
+    def __init__(self, database: str | Path) -> None:
+        path = Path(database)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._connection = sqlite3.connect(path, isolation_level=None, timeout=5.0)
+        self._connection.execute("PRAGMA busy_timeout=5000")
+        self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS consumed_approvals (
+                approval_id TEXT NOT NULL,
+                intent_digest TEXT NOT NULL,
+                executor_id TEXT NOT NULL,
+                consumed_at TEXT NOT NULL,
+                PRIMARY KEY (approval_id, intent_digest, executor_id)
+            )
+            """
+        )
+
+    def consume(self, approval_id: str, *, intent_digest: str, executor_id: str) -> bool:
+        try:
+            self._connection.execute(
+                "INSERT INTO consumed_approvals VALUES (?, ?, ?, ?)",
+                (approval_id, intent_digest, executor_id, datetime.now(UTC).isoformat()),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        return True
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+@dataclass(frozen=True, slots=True)
 class SignedApprovalReceipt:
     key_id: str
     approval_id: str
@@ -52,6 +127,7 @@ class SignedApprovalReceipt:
     scope: str
     intent_digest: str
     contract_digest: str
+    executor_id: str
     issued_at: datetime
     expires_at: datetime
     signature: str
@@ -59,7 +135,15 @@ class SignedApprovalReceipt:
     def __post_init__(self) -> None:
         if not all(
             value.strip()
-            for value in (self.key_id, self.approval_id, self.approver, self.scope, self.intent_digest, self.contract_digest)
+            for value in (
+                self.key_id,
+                self.approval_id,
+                self.approver,
+                self.scope,
+                self.intent_digest,
+                self.contract_digest,
+                self.executor_id,
+            )
         ):
             raise ValueError("approval receipt has a required blank field")
         if self.scope != "action.execute":
@@ -76,6 +160,7 @@ class SignedApprovalReceipt:
                 "scope": self.scope,
                 "intent_digest": self.intent_digest,
                 "contract_digest": self.contract_digest,
+                "executor_id": self.executor_id,
                 "issued_at": self.issued_at.isoformat(),
                 "expires_at": self.expires_at.isoformat(),
             }
@@ -109,6 +194,7 @@ class ApprovalSigner:
         intent: ActionIntent,
         contract: TaskContract,
         approver: str,
+        executor_id: str,
         ttl: timedelta = timedelta(minutes=10),
         now: datetime | None = None,
     ) -> SignedApprovalReceipt:
@@ -120,6 +206,7 @@ class ApprovalSigner:
             scope="action.execute",
             intent_digest=intent.intent_digest,
             contract_digest=contract.contract_digest,
+            executor_id=executor_id,
             issued_at=issued_at,
             expires_at=issued_at + ttl,
             signature="",
@@ -131,6 +218,7 @@ class ApprovalSigner:
             scope=unsigned.scope,
             intent_digest=unsigned.intent_digest,
             contract_digest=unsigned.contract_digest,
+            executor_id=unsigned.executor_id,
             issued_at=unsigned.issued_at,
             expires_at=unsigned.expires_at,
             signature=base64.urlsafe_b64encode(self._key.sign(unsigned.payload())).decode("ascii"),
@@ -144,15 +232,35 @@ class ApprovalVerifier:
         self,
         public_keys: Mapping[str, bytes | Ed25519PublicKey],
         *,
-        allowed_approvers: frozenset[str],
+        allowed_approvers: frozenset[str] = frozenset(),
+        trust_entries: Mapping[str, ApprovalTrustEntry] | None = None,
+        consumption_store: ApprovalConsumptionStore | None = None,
+        maximum_ttl: timedelta = timedelta(minutes=15),
+        maximum_age: timedelta = timedelta(minutes=15),
+        clock_skew: timedelta = timedelta(seconds=30),
     ) -> None:
-        if not public_keys or not allowed_approvers:
-            raise ValueError("approval verifier needs keys and allowed approvers")
+        if not public_keys or (not allowed_approvers and not trust_entries):
+            raise ValueError("approval verifier needs keys and approver trust")
         self._keys = {
             key_id: Ed25519PublicKey.from_public_bytes(key) if isinstance(key, bytes) else key
             for key_id, key in public_keys.items()
         }
         self._allowed_approvers = allowed_approvers
+        self._trust_entries = dict(trust_entries or {})
+        if self._trust_entries and set(self._trust_entries) != set(self._keys):
+            raise ValueError("approval trust entries must cover exactly the configured keys")
+        self._consumption_store = consumption_store or InMemoryApprovalConsumptionStore()
+        self._maximum_ttl = maximum_ttl
+        self._maximum_age = maximum_age
+        self._clock_skew = clock_skew
+
+    @property
+    def has_verifier_owned_trust(self) -> bool:
+        return bool(self._trust_entries)
+
+    @property
+    def consumption_store(self) -> ApprovalConsumptionStore:
+        return self._consumption_store
 
     def validate(
         self,
@@ -160,14 +268,30 @@ class ApprovalVerifier:
         *,
         intent: ActionIntent,
         contract: TaskContract,
+        executor_id: str,
         now: datetime | None = None,
     ) -> None:
         current = now or datetime.now(UTC)
-        if receipt.approver not in self._allowed_approvers:
+        trust = self._trust_entries.get(receipt.key_id)
+        if trust is not None:
+            if trust.subject != receipt.approver or "security-reviewer" not in trust.roles:
+                raise ApprovalRejected("approval key is not bound to this approver identity")
+            if current < trust.valid_from or current >= trust.valid_until or (
+                trust.revoked_at is not None and current >= trust.revoked_at
+            ):
+                raise ApprovalRejected("approval signing key is not currently trusted")
+        elif receipt.approver not in self._allowed_approvers:
             raise ApprovalRejected("approval signer identity is not allowed")
         if receipt.intent_digest != intent.intent_digest or receipt.contract_digest != contract.contract_digest:
             raise ApprovalRejected("approval is not bound to this intent and contract")
-        if receipt.expires_at <= current or receipt.issued_at > current:
+        if receipt.executor_id != executor_id:
+            raise ApprovalRejected("approval is not bound to this executor")
+        if (
+            receipt.expires_at <= current
+            or receipt.issued_at > current + self._clock_skew
+            or current - receipt.issued_at > self._maximum_age
+            or receipt.expires_at - receipt.issued_at > self._maximum_ttl
+        ):
             raise ApprovalRejected("approval is expired or not yet valid")
         key = self._keys.get(receipt.key_id)
         if key is None:
@@ -176,6 +300,10 @@ class ApprovalVerifier:
             key.verify(base64.urlsafe_b64decode(receipt.signature.encode("ascii")), receipt.payload())
         except (InvalidSignature, ValueError) as exc:
             raise ApprovalRejected("invalid approval signature") from exc
+        if not self._consumption_store.consume(
+            receipt.approval_id, intent_digest=intent.intent_digest, executor_id=executor_id
+        ):
+            raise ApprovalRejected("approval receipt was already consumed")
 
 
 class PolicyUseCounterStore:
@@ -309,11 +437,11 @@ class PolicyGate:
             raise PolicyDenied("intent references a different contract version")
         if intent.tool in self.contract.forbidden_actions:
             raise PolicyDenied(f"forbidden tool: {intent.tool}")
+        if self.contract.require_argument_provenance and not intent.has_complete_argument_provenance:
+            missing = sorted(set(intent.arguments).difference(intent.argument_provenance_graph))
+            raise PolicyDenied(f"action needs a complete provenance DAG for every argument: {missing}")
         if self._contains_inline_secret(intent.arguments):
             raise PolicyDenied("inline secrets are forbidden; use an executor-owned credential boundary")
-        if intent.effect in {Effect.DELETE, Effect.PUBLISH} and not self._is_approved(intent, approvals):
-            raise PolicyDenied(f"{intent.effect.value} always requires explicit approval")
-
         matching_rules = [
             rule
             for rule in self.contract.allowed_actions
@@ -328,19 +456,32 @@ class PolicyGate:
         untrusted_arguments = tuple(
             name
             for name in intent.arguments
-            if Provenance.UNTRUSTED_RETRIEVAL in intent.provenance_for_argument(name)
+            if {
+                Provenance.UNTRUSTED_RETRIEVAL,
+                Provenance.TOOL_OUTPUT,
+            }.intersection(intent.provenance_for_argument(name))
         )
-        if (
-            Provenance.UNTRUSTED_RETRIEVAL in intent.provenance or untrusted_arguments
+        tainted_high_impact = (
+            {
+                Provenance.UNTRUSTED_RETRIEVAL,
+                Provenance.TOOL_OUTPUT,
+            }.intersection(intent.provenance)
+            or untrusted_arguments
         ) and intent.effect in {
             Effect.WRITE,
             Effect.EXECUTE,
             Effect.NETWORK,
             Effect.DELETE,
             Effect.PUBLISH,
-        } and not self._is_approved(intent, approvals):
+        }
+        always_approval = intent.effect in {Effect.DELETE, Effect.PUBLISH}
+        requires_approval = always_approval or tainted_high_impact or approval_required
+        approved = self._is_approved(intent, approvals, executor_id=executor_id) if requires_approval else False
+        if tainted_high_impact and not approved:
             raise PolicyDenied("tainted high-impact action or argument requires explicit approval")
-        if approval_required and not self._is_approved(intent, approvals):
+        if always_approval and not approved:
+            raise PolicyDenied(f"{intent.effect.value} always requires explicit approval")
+        if approval_required and not approved:
             raise PolicyDenied("this action requires explicit approval")
         limits = tuple(
             (
@@ -385,13 +526,20 @@ class PolicyGate:
         self,
         intent: ActionIntent,
         approvals: Iterable[Approval | SignedApprovalReceipt],
+        *,
+        executor_id: str,
     ) -> bool:
         for approval in approvals:
             if isinstance(approval, SignedApprovalReceipt):
                 if self._approval_verifier is None:
                     continue
                 try:
-                    self._approval_verifier.validate(approval, intent=intent, contract=self.contract)
+                    self._approval_verifier.validate(
+                        approval,
+                        intent=intent,
+                        contract=self.contract,
+                        executor_id=executor_id,
+                    )
                 except ApprovalRejected:
                     continue
                 return True

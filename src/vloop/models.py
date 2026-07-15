@@ -141,6 +141,8 @@ class TaskContract:
     allowed_actions: tuple[ActionRule, ...]
     forbidden_actions: tuple[str, ...] = ()
     required_verifiers: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    success_condition_bindings: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    require_argument_provenance: bool = False
     maximum_iterations: int = 8
     maximum_tool_calls: int = 32
     expires_at: datetime | None = None
@@ -165,6 +167,18 @@ class TaskContract:
             required_names.extend(names)
         if len(required_names) != len(set(required_names)):
             raise ValueError("a required verifier check may belong to only one category")
+        if self.success_condition_bindings:
+            unknown_conditions = set(self.success_condition_bindings).difference(self.success_conditions)
+            missing_conditions = set(self.success_conditions).difference(self.success_condition_bindings)
+            if unknown_conditions or missing_conditions:
+                raise ValueError("success condition bindings must cover exactly the contract success conditions")
+            if any(
+                not names or any(not isinstance(name, str) or not name.strip() for name in names)
+                for names in self.success_condition_bindings.values()
+            ):
+                raise ValueError("success condition bindings need non-empty check names")
+        if not isinstance(self.require_argument_provenance, bool):
+            raise ValueError("require_argument_provenance must be a boolean")
 
     @property
     def contract_digest(self) -> str:
@@ -172,6 +186,81 @@ class TaskContract:
 
     def is_expired(self, now: datetime | None = None) -> bool:
         return self.expires_at is not None and (now or datetime.now(UTC)) >= self.expires_at
+
+
+@dataclass(frozen=True, slots=True)
+class ArgumentProvenanceNode:
+    """One immutable source or derivation in an argument-local provenance DAG.
+
+    The node deliberately records a source identifier and content digest rather
+    than raw context.  This lets policy decide from the exact causal inputs
+    while avoiding a second, unredacted copy of retrieved material in an
+    intent or capability.
+    """
+
+    node_id: str
+    provenance: Provenance
+    source_id: str
+    content_digest: str
+    parent_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.node_id.strip() or not self.source_id.strip():
+            raise ValueError("provenance nodes need an id and source id")
+        if len(self.content_digest) != 64 or any(
+            character not in "0123456789abcdef" for character in self.content_digest
+        ):
+            raise ValueError("provenance node content digest must be a SHA-256 hex digest")
+        if self.node_id in self.parent_ids or len(self.parent_ids) != len(set(self.parent_ids)):
+            raise ValueError("provenance node parent list is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ArgumentProvenance:
+    """Causal provenance for one concrete action argument.
+
+    ``value_digest`` binds the DAG to the exact serialized value passed to the
+    executor.  Parents must remain inside this argument graph: a graph from a
+    different value cannot be spliced in to make an untrusted value look
+    trusted.
+    """
+
+    value_digest: str
+    nodes: tuple[ArgumentProvenanceNode, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.value_digest) != 64 or any(
+            character not in "0123456789abcdef" for character in self.value_digest
+        ):
+            raise ValueError("argument provenance value digest must be a SHA-256 hex digest")
+        if not self.nodes:
+            raise ValueError("argument provenance needs at least one node")
+        by_id = {node.node_id: node for node in self.nodes}
+        if len(by_id) != len(self.nodes):
+            raise ValueError("argument provenance node ids must be unique")
+        if any(parent not in by_id for node in self.nodes for parent in node.parent_ids):
+            raise ValueError("argument provenance parent is outside the argument graph")
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(node_id: str) -> None:
+            if node_id in visiting:
+                raise ValueError("argument provenance must be acyclic")
+            if node_id in visited:
+                return
+            visiting.add(node_id)
+            for parent in by_id[node_id].parent_ids:
+                visit(parent)
+            visiting.remove(node_id)
+            visited.add(node_id)
+
+        for node_id in by_id:
+            visit(node_id)
+
+    @property
+    def categories(self) -> tuple[Provenance, ...]:
+        return tuple(sorted({node.provenance for node in self.nodes}, key=lambda item: item.value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +277,7 @@ class ActionIntent:
     contract_version: int
     idempotency_key: str = field(default_factory=lambda: str(uuid4()))
     argument_provenance: Mapping[str, tuple[Provenance, ...]] = field(default_factory=dict)
+    argument_provenance_graph: Mapping[str, ArgumentProvenance] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.target.startswith("/"):
@@ -205,13 +295,28 @@ class ActionIntent:
         for argument, provenance in self.argument_provenance.items():
             if not provenance or any(not isinstance(value, Provenance) for value in provenance):
                 raise ValueError(f"argument {argument!r} needs non-empty provenance")
+        unknown_graphs = set(self.argument_provenance_graph).difference(self.arguments)
+        if unknown_graphs:
+            raise ValueError("argument provenance graph refers to an unknown argument")
+        for argument, graph in self.argument_provenance_graph.items():
+            if not isinstance(graph, ArgumentProvenance):
+                raise ValueError(f"argument {argument!r} provenance graph is invalid")
+            if graph.value_digest != digest(self.arguments[argument]):
+                raise ValueError(f"argument {argument!r} provenance graph is bound to another value")
 
     @property
     def intent_digest(self) -> str:
         return digest(self)
 
     def provenance_for_argument(self, name: str) -> tuple[Provenance, ...]:
+        graph = self.argument_provenance_graph.get(name)
+        if graph is not None:
+            return graph.categories
         return self.argument_provenance.get(name, self.provenance)
+
+    @property
+    def has_complete_argument_provenance(self) -> bool:
+        return set(self.argument_provenance_graph) == set(self.arguments)
 
 
 @dataclass(frozen=True, slots=True)
