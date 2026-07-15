@@ -162,6 +162,16 @@ class CapabilityVerifier:
         )
         self._nonce_store = nonce_store
 
+    @property
+    def nonce_store(self) -> NonceStore:
+        """Store inspected by production configuration validation."""
+
+        return self._nonce_store
+
+    @property
+    def public_key_bytes(self) -> bytes:
+        return self._public_key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
     def validate(
         self,
         capability: Capability,

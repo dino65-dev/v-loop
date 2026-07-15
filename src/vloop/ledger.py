@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -21,9 +22,20 @@ class EvidenceLedger:
     def __init__(self, database: str | Path) -> None:
         self.path = Path(database)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self.path, isolation_level=None)
-        self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection = sqlite3.connect(self.path, isolation_level=None, timeout=5.0)
         self._connection.execute("PRAGMA busy_timeout=5000")
+        # Setting journal mode itself needs an exclusive lock. Concurrent
+        # first-openers retry that one-time transition rather than failing a
+        # valid writer before the ledger schema is even initialized.
+        for attempt in range(50):
+            try:
+                self._connection.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 49:
+                    self._connection.close()
+                    raise
+                time.sleep(0.01 * (attempt + 1))
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS ledger_events (
@@ -126,6 +138,35 @@ class EvidenceLedger:
             tuple(event_hashes),
         ).fetchone()
         return bool(row and row[0] == len(event_hashes))
+
+    def events_for_hashes(self, event_hashes: set[str] | frozenset[str]) -> dict[str, dict[str, Any]]:
+        """Return exact immutable events for a small attestation set.
+
+        This is intentionally for trusted committers such as ``MemoryLedger``;
+        callers still receive only events they already cite by hash.
+        """
+
+        if not event_hashes:
+            return {}
+        placeholders = ",".join("?" for _ in event_hashes)
+        rows = self._connection.execute(
+            f"""
+            SELECT sequence, event_type, occurred_at, payload, parent_hash, event_hash
+            FROM ledger_events WHERE event_hash IN ({placeholders})
+            """,
+            tuple(event_hashes),
+        ).fetchall()
+        return {
+            row[5]: {
+                "sequence": row[0],
+                "event_type": row[1],
+                "occurred_at": row[2],
+                "payload": json.loads(row[3]),
+                "parent_hash": row[4],
+                "event_hash": row[5],
+            }
+            for row in rows
+        }
 
     def verify_chain(self) -> bool:
         parent_hash = "0" * 64

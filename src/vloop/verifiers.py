@@ -57,8 +57,8 @@ class ExecutionVerifier:
         )
 
 
-class IsolationEvidenceVerifier:
-    """Hard policy check for the expected Firecracker isolation evidence."""
+class DevelopmentIsolationVerifier:
+    """Development-only metadata check; production uses a signed supervisor receipt."""
 
     category = "policy"
     phase = 1
@@ -87,8 +87,8 @@ class IsolationEvidenceVerifier:
         )
 
 
-class BenchmarkEvidenceVerifier:
-    """Checks repeatable benchmark evidence without trusting a textual claim."""
+class DevelopmentBenchmarkVerifier:
+    """Development-only benchmark metadata check; it is not a production oracle."""
 
     category = "quality"
     phase = 3
@@ -148,13 +148,8 @@ class BenchmarkEvidenceVerifier:
         )
 
 
-class DifferentialEvidenceVerifier:
-    """L2 reference-comparison receipt verifier.
-
-    A protected evaluator runs the reference and candidate.  The agent only
-    receives its compact receipt; fabricated or incomplete receipts are not a
-    successful differential test.
-    """
+class DevelopmentDifferentialVerifier:
+    """Development-only reference metadata check; fabricated data is possible."""
 
     category = "correctness"
     phase = 2
@@ -188,8 +183,8 @@ class DifferentialEvidenceVerifier:
         )
 
 
-class MetamorphicEvidenceVerifier:
-    """L2 transformation-invariant receipt verifier."""
+class DevelopmentMetamorphicVerifier:
+    """Development-only transformation metadata check; fabricated data is possible."""
 
     category = "correctness"
     phase = 2
@@ -253,7 +248,6 @@ class SignedReceiptVerifier:
         run_id: str | None,
         intent: ActionIntent | None,
     ) -> CheckResult:
-        del contract
         if run_id is None or intent is None:
             return CheckResult(self.name, CheckStatus.INCONCLUSIVE, {}, "missing verification binding")
         receipts = observation.metadata.get("evaluator_receipts")
@@ -268,6 +262,7 @@ class SignedReceiptVerifier:
                 run_id=run_id,
                 intent_digest=intent.intent_digest,
                 artifact_digests=observation.artifact_digests,
+                contract_digest=contract.contract_digest,
             )
         except (KeyError, TypeError, ValueError, ReceiptRejected) as exc:
             return CheckResult(
@@ -289,6 +284,16 @@ class SignedReceiptVerifier:
                 "candidate_artifact_digest": receipt.candidate_artifact_digest,
                 "evaluator_image_digest": receipt.evaluator_image_digest,
                 "test_suite_digest": receipt.test_suite_digest,
+                "workspace_snapshot_digest": receipt.workspace_snapshot_digest,
+                "dependency_lock_digest": receipt.dependency_lock_digest,
+                "toolchain_digest": receipt.toolchain_digest,
+                "environment_digest": receipt.environment_digest,
+                "artifact_manifest_digest": receipt.artifact_manifest_digest,
+                "primary_artifact_name": receipt.primary_artifact_name,
+                "primary_artifact_digest": receipt.primary_artifact_digest,
+                "schema_version": receipt.schema_version,
+                "signed_receipt": True,
+                "issued_at": receipt.issued_at.isoformat(),
                 "nonce": receipt.nonce,
             },
             "protected evaluator reported a failure" if status is CheckStatus.FAIL else "",
@@ -323,6 +328,12 @@ class HybridVerifier:
         checks: Iterable[Verifier],
     ) -> None:
         self._checks = tuple(checks)
+
+    @property
+    def checks(self) -> tuple[Verifier, ...]:
+        """Read-only registry used by production configuration validation."""
+
+        return self._checks
 
     def verify(
         self,
@@ -363,6 +374,23 @@ class HybridVerifier:
             if getattr(check, "phase", 2) <= 1 and result.status is not CheckStatus.PASS:
                 break
 
+        # A contract can make specific checks mandatory without relying on
+        # defaults for an otherwise empty verifier category. This is immutable
+        # contract data, not a planner decision.
+        for category, required_names in contract.required_verifiers.items():
+            observed = {result.name: result for result in results}
+            for name in required_names:
+                if name not in observed:
+                    results.append(
+                        CheckResult(
+                            name,
+                            CheckStatus.INCONCLUSIVE,
+                            {"required_by_contract": contract.contract_digest, "category": category},
+                            "required verifier did not run",
+                        )
+                    )
+                    categories[category].append(CheckStatus.INCONCLUSIVE)
+
         def reduce(statuses: list[CheckStatus]) -> CheckStatus:
             if not statuses:
                 return CheckStatus.INCONCLUSIVE
@@ -379,3 +407,11 @@ class HybridVerifier:
             quality=reduce(categories["quality"]) if categories["quality"] else CheckStatus.PASS,
             checks=tuple(results),
         )
+
+
+# Kept as explicit compatibility names for prototype and unit-test use. They
+# are intentionally rejected by ProductionRuntimeBuilder.
+IsolationEvidenceVerifier = DevelopmentIsolationVerifier
+BenchmarkEvidenceVerifier = DevelopmentBenchmarkVerifier
+DifferentialEvidenceVerifier = DevelopmentDifferentialVerifier
+MetamorphicEvidenceVerifier = DevelopmentMetamorphicVerifier

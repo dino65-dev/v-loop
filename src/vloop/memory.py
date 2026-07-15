@@ -278,6 +278,7 @@ class MemoryLedger:
         self._evidence_ledger = evidence_ledger
 
     def insert(self, verified: VerifiedMemory, *, supersedes: str | None = None) -> MemoryRecord:
+        self._validate_attested_promotion(verified)
         candidate = verified.candidate
         event_hash = self._evidence_ledger.append(
             "memory.promoted",
@@ -339,6 +340,40 @@ class MemoryLedger:
                 )
         return record
 
+    def _validate_attested_promotion(self, verified: VerifiedMemory) -> None:
+        """Defend the public insert API against forged ``VerifiedMemory`` values."""
+
+        candidate = verified.candidate
+        if verified.status not in {"verified", "diagnosed-failure"}:
+            raise PermissionError("memory status is not eligible for canonical storage")
+        if not candidate.memory_id or not candidate.evidence_refs:
+            raise PermissionError("memory must have an assigned id and evidence references")
+        if not self._evidence_ledger.verify_chain():
+            raise PermissionError("evidence ledger integrity check failed")
+        events = self._evidence_ledger.events_for_hashes(set(candidate.evidence_refs))
+        if len(events) != len(set(candidate.evidence_refs)):
+            raise PermissionError("memory cites unknown evidence")
+        if any(event["payload"].get("run_id") != verified.source_run_id for event in events.values()):
+            raise PermissionError("memory evidence belongs to another run")
+        if verified.status == "verified":
+            accepted_final = any(
+                event["event_type"] == "final-goal.completed" and event["payload"].get("status") == "pass"
+                for event in events.values()
+            )
+            if not accepted_final:
+                raise PermissionError("verified memory requires a cited passing final-goal event")
+        else:
+            diagnosed = any(
+                event["event_type"] == "verification.completed"
+                and (
+                    event["payload"].get("correctness") == "fail"
+                    or event["payload"].get("policy") == "fail"
+                )
+                for event in events.values()
+            )
+            if not diagnosed:
+                raise PermissionError("failure memory requires a cited hard diagnosis")
+
     def records(self, query: MemoryQuery) -> list[MemoryRecord]:
         allowed_scopes = {query.scope, *query.include_scopes}
         placeholders = ",".join("?" for _ in allowed_scopes)
@@ -388,17 +423,21 @@ class MemoryService:
         hot_index: MemoryIndex | None = None,
         associative_index: MemoryIndex | None = None,
         router: MemoryRouter | None = None,
+        rrf_k: int = 60,
     ) -> None:
         if not authorized_scopes:
             raise ValueError("at least one authorized memory scope is required")
         if not allowed_sensitivities:
             raise ValueError("at least one allowed memory sensitivity is required")
+        if rrf_k < 1:
+            raise ValueError("rrf_k must be positive")
         self.ledger = ledger
         self.authorized_scopes = authorized_scopes
         self.allowed_sensitivities = allowed_sensitivities
         self.hot_index = hot_index or HotLexicalIndex()
         self.associative_index = associative_index
         self.router = router or MemoryRouter()
+        self.rrf_k = rrf_k
 
     def retrieve(self, query: MemoryQuery) -> list[RetrievalResult]:
         if query.scope not in self.authorized_scopes or not set(query.include_scopes).issubset(
@@ -420,11 +459,28 @@ class MemoryService:
             results.extend(self.hot_index.search(query, records))
         if "associative" in selected and self.associative_index is not None:
             results.extend(self.associative_index.search(query, records))
-        unique: dict[str, RetrievalResult] = {}
+        # External retrieval scores are not calibrated against the local hot
+        # index. Reciprocal-rank fusion combines rank evidence without treating
+        # one backend's arbitrary score scale as more authoritative.
+        per_source: dict[str, dict[str, RetrievalResult]] = {}
         for result in results:
-            existing = unique.get(result.record.memory_id)
+            source_results = per_source.setdefault(result.source, {})
+            existing = source_results.get(result.record.memory_id)
             if existing is None or result.score > existing.score:
-                unique[result.record.memory_id] = result
+                source_results[result.record.memory_id] = result
+        fused: dict[str, tuple[MemoryRecord, float, list[str]]] = {}
+        for source, source_results in per_source.items():
+            ranked = sorted(
+                source_results.values(),
+                key=lambda result: (-result.score, -result.record.promoted_at.timestamp()),
+            )
+            for rank, result in enumerate(ranked, start=1):
+                record, score, sources = fused.get(result.record.memory_id, (result.record, 0.0, []))
+                fused[result.record.memory_id] = (record, score + 1.0 / (self.rrf_k + rank), [*sources, source])
+        unique = {
+            memory_id: RetrievalResult(record, score, "rrf:" + "+".join(sorted(sources)))
+            for memory_id, (record, score, sources) in fused.items()
+        }
         return sorted(
             unique.values(),
             key=lambda result: (-result.score, -result.record.promoted_at.timestamp()),

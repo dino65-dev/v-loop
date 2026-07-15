@@ -18,13 +18,18 @@ can authorize it and only independently recorded evidence can satisfy a task.
 
 - versioned task contracts and per-action budgets;
 - default-deny reference monitor, restrictive overlapping rules, and
-  Ed25519-signed, audience-bound executor capabilities;
-- executor-side one-time nonce consumption and idempotency reservation;
+  Ed25519-signed, audience-bound executor capabilities, typed argument
+  semantics, and argument-level provenance;
+- executor-side one-time nonce consumption and lease-aware idempotency state;
 - hash-chained SQLite evidence ledger with a transactional singleton head;
 - structured pass/fail/inconclusive verifier results and deterministic
   acceptance rules, plus an explicit final-goal receipt before acceptance;
 - L0 structural validation, phased verifier execution, and signed evaluator
-  receipts bound to run, intent, and actual executor artifact digests;
+  receipts bound to run, intent, contract, canonical artifact manifest, primary
+  artifact, evaluator policy, and signed workspace/toolchain state;
+- explicit development and production runtime recipes; production startup
+  rejects metadata-only verifiers, missing durable stores, unsigned approvals,
+  missing probe policy, or an unsigned Firecracker supervisor;
 - failure diagnosis, retry de-duplication, and terminal budget handling;
 - evidence-bound memory-record schema and promotion gate;
 - canonical verified-memory ledger, L0 working-state store, scoped retrieval,
@@ -45,6 +50,8 @@ can authorize it and only independently recorded evidence can satisfy a task.
 - authority-bounded task-contract compilation from server-owned tool catalogs;
 - context and state packaging with bounded retrieval, environment fingerprints,
   and explicit untrusted-data provenance;
+- signed, expiring approval receipts plus a `waiting` terminal state for work
+  that requires an external reviewer;
 - optional OpenAI-compatible planner wiring for the configured BazaarLink
   endpoint and DeepSeek model.
 
@@ -55,8 +62,17 @@ Production actions must place every raw executor behind
 `CapabilityEnforcingExecutor`. The policy service retains the Ed25519 private
 key; the executor holds only the public verification key plus a durable nonce
 and idempotency store. It verifies audience, expiry, exact intent binding and
-signature immediately before the side effect. Raw executors are not policy
-enforcement points and must not be exposed to untrusted callers.
+signature immediately before the side effect. A stale in-flight reservation is
+made `indeterminate`, never replayed after a crash. Raw executors are not
+policy enforcement points and must not be exposed to untrusted callers.
+
+`DevelopmentRuntime` may use local callbacks and metadata checks. It is
+intentionally not production-safe. `ProductionRuntimeBuilder.validate()` is the
+required deployment gate: it requires a `CapabilityEnforcingExecutor` over a
+Firecracker executor, SQLite nonce/idempotency/policy-budget stores,
+policy-bound schema-v2 signed receipts for every contract-required verifier,
+`StructuralVerifier`, a final verifier, non-empty protected probes, a signed
+approval verifier, and a policy-bound Firecracker supervisor receipt.
 
 Use BubblewrapExecutor (or another separately deployed executor) with separate
 credentials, read-only evaluator assets, constrained mounts, no network unless
@@ -74,10 +90,17 @@ writable jailer chroot, guest assets, and usable `/dev/kvm` before deployment.
 does not start a VM: a separately privileged supervisor must materialize the
 manifest/config, prepare a fresh job drive, manage VM lifecycle, hash the
 result after shutdown, destroy the drive, and return a signed supervisor
-receipt. When `FirecrackerExecutor` is configured with a receipt verifier, it
-rejects a result unless the receipt binds the run, intent, actual artifact,
-job/manifest, fresh drive, and destruction attestation. This is intentional;
-the controller never holds KVM or jailer authority.
+receipt. The production runtime always configures this verifier; it rejects a
+result unless the receipt binds the run, intent, contract, complete artifact
+manifest and primary artifact, job/manifest, fresh drive, and destruction
+attestation. This is intentional; the controller never holds KVM or jailer
+authority.
+
+The repository does not provide a privileged Firecracker supervisor, evaluator
+service, external ledger anchor, or durable controller orchestrator. Those are
+separate deployment services with distinct credentials. The production builder
+prevents a local substitute from being labelled production, but it cannot
+create or operate those services on the deployer's behalf.
 
 ## Quick start
 
@@ -98,8 +121,11 @@ proposal still passes through the contract and policy gate.
 Every `VerifiedLoop` run now requires an explicit `FinalVerifier` before it can
 return `accept`. The controller accumulates action evidence over the whole run.
 `RequiredChecksFinalVerifier` binds each immutable success condition to named
-protected checks and accepts only checks fresh for the final source-state
-digest; a check from before the final source change cannot satisfy completion.
+protected checks and accepts only checks fresh for the final signed
+workspace-state digest; a check from before the final source change cannot
+satisfy completion. Later valid results supersede earlier ones, while a tied
+contradiction remains inconclusive. Guest-provided `source_state_digest`
+metadata is never used for final completion.
 Production systems can instead supply a separate end-to-end evaluator. A
 passing action report or neural diagnostic alone is never enough to complete a
 task.
@@ -175,6 +201,9 @@ or bypass memory-write verification.
 
 VerifiedMemoryCommitter wires this gate into a completed controller run: it
 requires a passing final-goal receipt and verifies that every memory citation is
-an event hash from that run. DiagnosedFailureMemoryGate separately admits only
-hard correctness or policy failures; free-form model reflections remain
-non-reusable.
+an event hash from that run. `MemoryLedger.insert` repeats that attestation so
+a caller cannot bypass the committer by constructing a `VerifiedMemory` value.
+When both hot and associative indexes are active, `MemoryService` fuses their
+rankings with reciprocal-rank fusion rather than comparing incompatible raw
+scores. DiagnosedFailureMemoryGate separately admits only hard correctness or
+policy failures; free-form model reflections remain non-reusable.

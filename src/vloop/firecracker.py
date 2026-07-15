@@ -225,7 +225,13 @@ class FirecrackerJobBuilder:
         self.assets = assets
         self.resources = resources
 
-    def build(self, intent: ActionIntent, *, run_id: str = "unbound") -> FirecrackerLaunch:
+    def build(
+        self,
+        intent: ActionIntent,
+        *,
+        run_id: str = "unbound",
+        contract_digest: str | None = None,
+    ) -> FirecrackerLaunch:
         if intent.tool != "command.run" or intent.effect is not Effect.EXECUTE:
             raise FirecrackerConfigurationError("Firecracker only executes command.run intents")
         command = intent.arguments.get("command")
@@ -245,6 +251,7 @@ class FirecrackerJobBuilder:
             "schema_version": 1,
             "job_id": job_id,
             "run_id": run_id,
+            "contract_digest": contract_digest or "unbound",
             "intent_digest": intent.intent_digest,
             "argv": command,
             "working_directory": "/workspace",
@@ -300,13 +307,23 @@ class FirecrackerExecutor:
         self._supervisor = supervisor
         self._supervisor_receipt_verifier = supervisor_receipt_verifier
         self._run_id: str | None = None
+        self._contract_digest: str | None = None
 
-    def bind_run(self, run_id: str) -> None:
+    @property
+    def supervisor_receipt_verifier(self) -> ReceiptVerifier | None:
+        return self._supervisor_receipt_verifier
+
+    def bind_run(self, run_id: str, contract_digest: str | None = None) -> None:
         self._run_id = run_id
+        self._contract_digest = contract_digest
 
     def execute(self, intent: ActionIntent) -> ExecutionObservation:
         try:
-            launch = self._builder.build(intent, run_id=self._run_id or "unbound")
+            launch = self._builder.build(
+                intent,
+                run_id=self._run_id or "unbound",
+                contract_digest=self._contract_digest,
+            )
         except FirecrackerConfigurationError as exc:
             return ExecutionObservation(False, None, "", str(exc), metadata={"executor": "firecracker"})
         result = self._supervisor.run(launch)
@@ -371,6 +388,7 @@ class FirecrackerExecutor:
                 run_id=self._run_id,
                 intent_digest=intent.intent_digest,
                 artifact_digests=result.artifact_digests,
+                contract_digest=self._contract_digest,
             )
         except (KeyError, TypeError, ValueError, ReceiptRejected):
             return "supervisor-signed execution receipt was rejected"

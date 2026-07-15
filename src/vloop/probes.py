@@ -90,6 +90,10 @@ class ProtectedProbeRunner:
             raise ValueError("probe ids must be unique")
         self._probes = registered
 
+    @property
+    def definitions(self) -> tuple[ProbeDefinition, ...]:
+        return tuple(probe.definition for probe in self._probes)
+
     def run(
         self,
         *,

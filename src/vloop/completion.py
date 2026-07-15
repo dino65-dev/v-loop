@@ -57,13 +57,23 @@ class EvidenceAccumulator:
         observation: ExecutionObservation,
         report: VerificationReport,
     ) -> None:
-        source_digest = observation.metadata.get("source_state_digest")
+        # Workspace state is authoritative only when it is contained in a
+        # verified evaluator/supervisor receipt. Guest metadata is attacker
+        # controlled and may never select which historical checks are fresh.
+        signed_source_digests = {
+            value
+            for check in report.checks
+            if check.evidence.get("signed_receipt") is True
+            for value in (check.evidence.get("workspace_snapshot_digest"),)
+            if isinstance(value, str) and value
+        }
+        source_digest = next(iter(signed_source_digests)) if len(signed_source_digests) == 1 else None
         self._actions.append(
             ActionEvidence(
                 sequence=len(self._actions) + 1,
                 intent_digest=intent.intent_digest,
                 artifact_digests=dict(observation.artifact_digests),
-                source_state_digest=source_digest if isinstance(source_digest, str) and source_digest else None,
+                source_state_digest=source_digest,
                 report=report,
             )
         )
@@ -153,16 +163,24 @@ class RequiredChecksFinalVerifier:
             if final_source is not None
             else [evidence.actions[-1]]
         )
-        statuses: dict[str, CheckStatus] = {}
+        candidates: dict[str, list[tuple[int, str, CheckStatus]]] = {}
         for action in relevant:
             for check in action.report.checks:
-                existing = statuses.get(check.name)
-                if existing is CheckStatus.FAIL or check.status is CheckStatus.FAIL:
-                    statuses[check.name] = CheckStatus.FAIL
-                elif existing is CheckStatus.INCONCLUSIVE or check.status is CheckStatus.INCONCLUSIVE:
-                    statuses[check.name] = CheckStatus.INCONCLUSIVE
-                else:
-                    statuses[check.name] = CheckStatus.PASS
+                issued_at = check.evidence.get("issued_at")
+                receipt_time = issued_at if isinstance(issued_at, str) else ""
+                candidates.setdefault(check.name, []).append((action.sequence, receipt_time, check.status))
+        statuses: dict[str, CheckStatus] = {}
+        for name, values in candidates.items():
+            # Latest valid receipt wins. A tie on sequence/time with different
+            # deterministic outcomes is a contradictory attestation, not a
+            # reason to silently prefer failure or success.
+            latest = max(values, key=lambda value: (value[1], value[0]))
+            tied = [value for value in values if value[:2] == latest[:2]]
+            statuses[name] = (
+                CheckStatus.INCONCLUSIVE
+                if len({value[2] for value in tied}) > 1
+                else latest[2]
+            )
         return statuses
 
 

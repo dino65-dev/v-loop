@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import threading
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, Sequence
 
@@ -37,6 +38,8 @@ class IdempotencyStore(Protocol):
 
     def complete(self, key: tuple[str, str, str], observation: ExecutionObservation) -> None: ...
 
+    def mark_indeterminate(self, key: tuple[str, str, str], observation: ExecutionObservation) -> None: ...
+
 
 class InMemoryIdempotencyStore:
     """Thread-safe test/development idempotency store."""
@@ -44,12 +47,15 @@ class InMemoryIdempotencyStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._records: dict[tuple[str, str, str], ExecutionObservation | None] = {}
+        self._indeterminate: set[tuple[str, str, str]] = set()
 
     def reserve(self, key: tuple[str, str, str]) -> tuple[str, ExecutionObservation | None]:
         with self._lock:
             if key not in self._records:
                 self._records[key] = None
                 return "reserved", None
+            if key in self._indeterminate:
+                return "indeterminate", self._records[key]
             record = self._records[key]
             return ("pending", None) if record is None else ("completed", record)
 
@@ -57,15 +63,29 @@ class InMemoryIdempotencyStore:
         with self._lock:
             self._records[key] = observation
 
+    def mark_indeterminate(self, key: tuple[str, str, str], observation: ExecutionObservation) -> None:
+        with self._lock:
+            self._records[key] = observation
+            self._indeterminate.add(key)
+
 
 class SQLiteIdempotencyStore:
-    """Durable executor-side idempotency table with transactional reservation."""
+    """Durable, lease-aware idempotency state with fail-closed crash recovery.
 
-    def __init__(self, database: str | Path) -> None:
+    A process dying after a side effect cannot safely retry the operation.  An
+    expired pending lease is therefore recorded as ``indeterminate`` and must
+    be reconciled by an operator/supervisor, never silently replayed.
+    """
+
+    def __init__(self, database: str | Path, *, lease_duration: timedelta = timedelta(minutes=5)) -> None:
+        if lease_duration <= timedelta(0):
+            raise ValueError("idempotency lease duration must be positive")
         path = Path(database)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(path, isolation_level=None)
         self._connection.execute("PRAGMA busy_timeout=5000")
+        self._connection.execute("PRAGMA journal_mode=WAL")
+        self._lease_duration = lease_duration
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS executor_idempotency (
@@ -74,28 +94,124 @@ class SQLiteIdempotencyStore:
                 idempotency_key TEXT NOT NULL,
                 state TEXT NOT NULL,
                 observation_json TEXT,
+                owner_id TEXT,
+                lease_expires_at TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT,
+                updated_at TEXT,
                 PRIMARY KEY (executor_id, contract_digest, idempotency_key)
             )
             """
         )
+        # Allow an in-place upgrade from the first prototype schema.
+        existing_columns = {
+            row[1] for row in self._connection.execute("PRAGMA table_info(executor_idempotency)").fetchall()
+        }
+        for column, declaration in (
+            ("owner_id", "TEXT"),
+            ("lease_expires_at", "TEXT"),
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("created_at", "TEXT"),
+            ("updated_at", "TEXT"),
+        ):
+            if column not in existing_columns:
+                self._connection.execute(f"ALTER TABLE executor_idempotency ADD COLUMN {column} {declaration}")
 
     def reserve(self, key: tuple[str, str, str]) -> tuple[str, ExecutionObservation | None]:
-        with self._connection:
+        now = datetime.now(UTC)
+        owner_id = f"pid-{threading.get_ident()}-{now.timestamp()}"
+        lease_expires_at = (now + self._lease_duration).isoformat()
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
             row = self._connection.execute(
-                "SELECT state, observation_json FROM executor_idempotency WHERE executor_id = ? AND contract_digest = ? AND idempotency_key = ?",
+                """
+                SELECT state, observation_json, lease_expires_at
+                FROM executor_idempotency
+                WHERE executor_id = ? AND contract_digest = ? AND idempotency_key = ?
+                """,
                 key,
             ).fetchone()
             if row is None:
                 self._connection.execute(
-                    "INSERT INTO executor_idempotency VALUES (?, ?, ?, 'pending', NULL)", key
+                    """
+                    INSERT INTO executor_idempotency
+                    (executor_id, contract_digest, idempotency_key, state, observation_json,
+                     owner_id, lease_expires_at, attempts, created_at, updated_at)
+                    VALUES (?, ?, ?, 'pending', NULL, ?, ?, 1, ?, ?)
+                    """,
+                    (*key, owner_id, lease_expires_at, now.isoformat(), now.isoformat()),
                 )
+                self._connection.execute("COMMIT")
                 return "reserved", None
-        if row[0] == "pending":
+            state, encoded, lease = row
+            if state == "completed":
+                self._connection.execute("COMMIT")
+                return "completed", self._decode_observation(encoded)
+            if state == "indeterminate":
+                self._connection.execute("COMMIT")
+                return "indeterminate", self._decode_observation(encoded) if encoded else None
+            if state != "pending":
+                raise RuntimeError(f"unknown idempotency state: {state}")
+            expired = not lease or datetime.fromisoformat(lease) <= now
+            if expired:
+                observation = self._indeterminate_observation("prior executor lease expired; side effect outcome is unknown")
+                self._connection.execute(
+                    """
+                    UPDATE executor_idempotency
+                    SET state = 'indeterminate', observation_json = ?, updated_at = ?
+                    WHERE executor_id = ? AND contract_digest = ? AND idempotency_key = ?
+                    """,
+                    (self._encode_observation(observation), now.isoformat(), *key),
+                )
+                self._connection.execute("COMMIT")
+                return "indeterminate", observation
+            self._connection.execute("COMMIT")
             return "pending", None
-        return "completed", self._decode_observation(row[1])
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
 
     def complete(self, key: tuple[str, str, str], observation: ExecutionObservation) -> None:
-        encoded = json.dumps(
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = self._connection.execute(
+                """
+                UPDATE executor_idempotency
+                SET state = 'completed', observation_json = ?, owner_id = NULL,
+                    lease_expires_at = NULL, updated_at = ?
+                WHERE executor_id = ? AND contract_digest = ? AND idempotency_key = ? AND state = 'pending'
+                """,
+                (self._encode_observation(observation), datetime.now(UTC).isoformat(), *key),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("idempotency reservation was lost before completion")
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    def mark_indeterminate(self, key: tuple[str, str, str], observation: ExecutionObservation) -> None:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = self._connection.execute(
+                """
+                UPDATE executor_idempotency
+                SET state = 'indeterminate', observation_json = ?, owner_id = NULL,
+                    lease_expires_at = NULL, updated_at = ?
+                WHERE executor_id = ? AND contract_digest = ? AND idempotency_key = ? AND state = 'pending'
+                """,
+                (self._encode_observation(observation), datetime.now(UTC).isoformat(), *key),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("idempotency reservation was lost before indeterminate recovery")
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _encode_observation(observation: ExecutionObservation) -> str:
+        return json.dumps(
             {
                 "success": observation.success,
                 "exit_code": observation.exit_code,
@@ -106,11 +222,16 @@ class SQLiteIdempotencyStore:
             },
             sort_keys=True,
         )
-        with self._connection:
-            self._connection.execute(
-                "UPDATE executor_idempotency SET state = 'completed', observation_json = ? WHERE executor_id = ? AND contract_digest = ? AND idempotency_key = ?",
-                (encoded, *key),
-            )
+
+    @staticmethod
+    def _indeterminate_observation(reason: str) -> ExecutionObservation:
+        return ExecutionObservation(
+            False,
+            None,
+            "",
+            reason,
+            metadata={"idempotency_state": "indeterminate"},
+        )
 
     @staticmethod
     def _decode_observation(encoded: str | None) -> ExecutionObservation:
@@ -148,6 +269,18 @@ class CapabilityEnforcingExecutor:
         self._capability_verifier = capability_verifier
         self._idempotency_store = idempotency_store
 
+    @property
+    def raw_executor(self) -> RawExecutor:
+        return self._raw_executor
+
+    @property
+    def idempotency_store(self) -> IdempotencyStore:
+        return self._idempotency_store
+
+    @property
+    def capability_verifier(self) -> CapabilityVerifier:
+        return self._capability_verifier
+
     def execute(self, intent: ActionIntent, capability: Capability) -> ExecutionObservation:
         try:
             self._capability_verifier.validate(capability, intent, executor_id=self.executor_id)
@@ -162,6 +295,18 @@ class CapabilityEnforcingExecutor:
             )
         if state == "pending":
             return self._authorization_failure("idempotency key is already executing")
+        if state == "indeterminate":
+            return replace(
+                cached or SQLiteIdempotencyStore._indeterminate_observation(
+                    "previous execution outcome is unknown"
+                ),
+                metadata={
+                    **(cached.metadata if cached else {}),
+                    "executor_id": self.executor_id,
+                    "capability_verified": True,
+                    "idempotency_state": "indeterminate",
+                },
+            )
         try:
             self._capability_verifier.validate_and_consume(
                 capability, intent, executor_id=self.executor_id
@@ -170,20 +315,43 @@ class CapabilityEnforcingExecutor:
             observation = self._authorization_failure(str(exc))
             self._idempotency_store.complete(key, observation)
             return observation
-        observation = self._raw_executor.execute(intent)
+        try:
+            observation = self._raw_executor.execute(intent)
+        except Exception as exc:
+            observation = SQLiteIdempotencyStore._indeterminate_observation(
+                f"raw executor raised {type(exc).__name__}; side effect outcome is unknown"
+            )
+            self._idempotency_store.mark_indeterminate(key, observation)
+            return replace(
+                observation,
+                metadata={**observation.metadata, "executor_id": self.executor_id, "capability_verified": True},
+            )
         observation = replace(
             observation,
             metadata={**observation.metadata, "executor_id": self.executor_id, "capability_verified": True},
         )
-        self._idempotency_store.complete(key, observation)
+        try:
+            self._idempotency_store.complete(key, observation)
+        except Exception as exc:
+            indeterminate = SQLiteIdempotencyStore._indeterminate_observation(
+                f"execution completed but durable receipt failed: {type(exc).__name__}"
+            )
+            try:
+                self._idempotency_store.mark_indeterminate(key, indeterminate)
+            except Exception:
+                pass
+            return replace(
+                indeterminate,
+                metadata={**indeterminate.metadata, "executor_id": self.executor_id, "capability_verified": True},
+            )
         return observation
 
-    def bind_run(self, run_id: str) -> None:
+    def bind_run(self, run_id: str, contract_digest: str | None = None) -> None:
         """Forward the controller run binding to raw executors that need it."""
 
         binder = getattr(self._raw_executor, "bind_run", None)
         if callable(binder):
-            binder(run_id)
+            binder(run_id, contract_digest)
 
     def _authorization_failure(self, reason: str) -> ExecutionObservation:
         return ExecutionObservation(

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from .models import ActionRule, Effect, TaskContract
+from .models import ActionRule, ArgumentRule, Effect, TaskContract
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +33,8 @@ class ToolAuthority:
     permitted_prefixes: tuple[str, ...]
     approval_required: bool = False
     max_uses: int | None = None
+    argument_rules: tuple[ArgumentRule, ...] = ()
+    allow_unlisted_arguments: bool = True
 
 
 class ContractCompilationError(ValueError):
@@ -64,6 +66,8 @@ class TaskContractCompiler:
                     target_prefix=action.target_prefix,
                     approval_required=any(authority.approval_required for authority in authorities),
                     max_uses=self._minimum_max_uses(authorities),
+                    argument_rules=self._intersect_argument_rules(authorities),
+                    allow_unlisted_arguments=all(authority.allow_unlisted_arguments for authority in authorities),
                 )
             )
         if not rules:
@@ -95,6 +99,43 @@ class TaskContractCompiler:
     def _minimum_max_uses(authorities: tuple[ToolAuthority, ...]) -> int | None:
         limits = [authority.max_uses for authority in authorities if authority.max_uses is not None]
         return min(limits) if limits else None
+
+    @staticmethod
+    def _intersect_argument_rules(authorities: tuple[ToolAuthority, ...]) -> tuple[ArgumentRule, ...]:
+        """Keep every catalog constraint; PolicyGate applies all overlaps."""
+
+        by_name: dict[str, list[ArgumentRule]] = {}
+        for authority in authorities:
+            for rule in authority.argument_rules:
+                by_name.setdefault(rule.name, []).append(rule)
+        combined: list[ArgumentRule] = []
+        for name, rules in sorted(by_name.items()):
+            first = rules[0]
+            if any(rule.kind is not first.kind for rule in rules[1:]):
+                raise ContractCompilationError(f"conflicting argument kinds for {name!r}")
+            allowed_values = ()
+            if first.kind.value == "enum":
+                allowed = set(first.allowed_values)
+                for rule in rules[1:]:
+                    allowed.intersection_update(rule.allowed_values)
+                if not allowed:
+                    raise ContractCompilationError(f"overlapping authority has no common values for {name!r}")
+                allowed_values = tuple(sorted(allowed))
+            maximum_lengths = [rule.maximum_length for rule in rules if rule.maximum_length is not None]
+            minimums = [rule.minimum for rule in rules if rule.minimum is not None]
+            maximums = [rule.maximum for rule in rules if rule.maximum is not None]
+            combined.append(
+                ArgumentRule(
+                    name=name,
+                    kind=first.kind,
+                    required=any(rule.required for rule in rules),
+                    allowed_values=allowed_values,
+                    maximum_length=min(maximum_lengths) if maximum_lengths else None,
+                    minimum=max(minimums) if minimums else None,
+                    maximum=min(maximums) if maximums else None,
+                )
+            )
+        return tuple(combined)
 
     @staticmethod
     def _is_within(requested_prefix: str, permitted_prefix: str) -> bool:

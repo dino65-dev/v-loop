@@ -24,7 +24,7 @@ from .models import (
     VerificationReport,
 )
 from .neural_verifier import ShadowNeuralVerifier
-from .policy import Approval, PolicyDenied, PolicyGate
+from .policy import Approval, PolicyDenied, PolicyGate, SignedApprovalReceipt
 from .probes import ProbeReport, ProtectedProbeRunner
 from .repair import RepairController
 from .verifiers import HybridVerifier
@@ -89,7 +89,7 @@ class VerifiedLoop:
         self._seen_failures: set[tuple[str, str]] = set()
         self._tool_calls = 0
 
-    def run(self, approvals: Iterable[Approval] = ()) -> LoopDecision:
+    def run(self, approvals: Iterable[Approval | SignedApprovalReceipt] = ()) -> LoopDecision:
         self.ledger.append(
             "run.started",
             {"run_id": self.run_id, "contract_digest": self.contract.contract_digest},
@@ -117,17 +117,20 @@ class VerifiedLoop:
                     approvals=approvals,
                 )
             except PolicyDenied as exc:
-                self._history.append({"intent": intent.intent_digest, "failure": str(exc)})
+                reason = str(exc)
+                self._history.append({"intent": intent.intent_digest, "failure": reason})
                 self.ledger.append(
                     "intent.denied",
-                    {"run_id": self.run_id, "intent_digest": intent.intent_digest, "reason": str(exc)},
+                    {"run_id": self.run_id, "intent_digest": intent.intent_digest, "reason": reason},
                 )
+                if "requires explicit approval" in reason or "this action requires explicit approval" in reason:
+                    return self._terminal(LoopDecision.WAITING, "approval-required")
                 return self._terminal(LoopDecision.ESCALATE, "policy-denied")
 
             self._tool_calls += 1
             binder = getattr(self.executor, "bind_run", None)
             if callable(binder):
-                binder(self.run_id)
+                binder(self.run_id, self.contract.contract_digest)
             observation = self.executor.execute(intent, capability)
             execution_event_hash = self.ledger.append(
                 "execution.observed",
@@ -291,10 +294,20 @@ class VerifiedLoop:
         if context is None:
             return intent
         # A controller cannot inspect a model's attention.  Conservatively mark
-        # every action proposed with a package containing untrusted material as
-        # tainted; PolicyGate then applies its approval rules.
+        # every action argument proposed with a package containing untrusted
+        # material as tainted; PolicyGate can then reason at argument granularity
+        # instead of relying on a single self-declared action label.
         provenance = tuple(sorted(set(intent.provenance).union(context.provenance), key=lambda value: value.value))
-        return replace(intent, provenance=provenance)
+        argument_provenance = {
+            name: tuple(
+                sorted(
+                    set(intent.provenance_for_argument(name)).union(context.provenance),
+                    key=lambda value: value.value,
+                )
+            )
+            for name in intent.arguments
+        }
+        return replace(intent, provenance=provenance, argument_provenance=argument_provenance)
 
     def _record_shadow_diagnostic(
         self, intent: ActionIntent, observation: ExecutionObservation, report: VerificationReport
