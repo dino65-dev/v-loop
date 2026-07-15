@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
-from typing import Iterable, Protocol
+from typing import Iterable, Mapping, Protocol
 from uuid import uuid4
 
 from .canonical import digest
-from .completion import EvidenceAccumulator, FinalVerifier
+from .completion import ActionSafetyReport, EvidenceAccumulator, FinalVerifier, TaskCompletionReport
 from .context import ContextPackage, ContextTrust
+from .evaluation import ProtectedEvaluationOrchestrator
 from .executor import Executor
 from .ledger import EvidenceLedger
 from .memory import MemoryCandidateProducer, VerifiedMemoryCommitter
@@ -53,6 +54,19 @@ class ContextualPlanner(Protocol):
     ) -> ActionIntent: ...
 
 
+class EffectReconciler(Protocol):
+    """Deployment-owned reconciliation of an uncertain previously-started effect."""
+
+    def reconcile(
+        self,
+        *,
+        run_id: str,
+        contract: TaskContract,
+        intent: ActionIntent,
+        executor_id: str,
+    ) -> ExecutionObservation: ...
+
+
 class VerifiedLoop:
     """Small-step controller with deterministic stop and acceptance behavior."""
 
@@ -74,6 +88,8 @@ class VerifiedLoop:
         memory_candidate_producer: MemoryCandidateProducer | None = None,
         state_store: RunStateStore | None = None,
         run_id: str | None = None,
+        effect_reconciler: EffectReconciler | None = None,
+        evaluation_orchestrator: ProtectedEvaluationOrchestrator | None = None,
     ) -> None:
         self.contract = contract
         self.planner = planner
@@ -89,6 +105,8 @@ class VerifiedLoop:
         self.memory_committer = memory_committer
         self.memory_candidate_producer = memory_candidate_producer
         self.state_store = state_store
+        self.effect_reconciler = effect_reconciler
+        self.evaluation_orchestrator = evaluation_orchestrator
         self.run_id = run_id or str(uuid4())
         self._evidence = EvidenceAccumulator(self.run_id)
         self._history: list[dict] = []
@@ -104,7 +122,27 @@ class VerifiedLoop:
         for iteration in range(start_iteration, self.contract.maximum_iterations + 1):
             if self._tool_calls >= self.contract.maximum_tool_calls:
                 return self._terminal(LoopDecision.STOP, "tool-call-budget-exhausted")
-            if self._checkpoint is not None and self._checkpoint.phase is RunPhase.PENDING_AUTHORIZATION:
+            reconciled = self._checkpoint is not None and self._checkpoint.phase is RunPhase.RECONCILED_EFFECT
+            if reconciled:
+                intent = self._checkpoint.pending_intent
+                observation = self._checkpoint.reconciled_observation
+                assert intent is not None and observation is not None  # checkpoint invariant
+                execution_event_hash = self.ledger.append(
+                    "execution.reconciled",
+                    {
+                        "run_id": self.run_id,
+                        "iteration": iteration,
+                        "intent_digest": intent.intent_digest,
+                        "executor_id": self._checkpoint.executor_id,
+                        "success": observation.success,
+                        "exit_code": observation.exit_code,
+                        "artifact_digests": dict(observation.artifact_digests),
+                    },
+                )
+            elif self._checkpoint is not None and self._checkpoint.phase in {
+                RunPhase.PENDING_AUTHORIZATION,
+                RunPhase.AWAITING_APPROVAL,
+            }:
                 intent = self._checkpoint.pending_intent
                 assert intent is not None  # checkpoint invariant
                 self.ledger.append(
@@ -126,49 +164,91 @@ class VerifiedLoop:
                     },
                 )
                 self._checkpoint_pending_authorization(iteration, intent)
-            try:
-                capability = self.gate.authorize(
-                    intent,
-                    executor_id=self.executor.executor_id,
-                    approvals=approvals,
-                )
-            except PolicyDenied as exc:
-                reason = str(exc)
-                self._history.append({"intent": intent.intent_digest, "failure": reason})
-                self.ledger.append(
-                    "intent.denied",
-                    {"run_id": self.run_id, "intent_digest": intent.intent_digest, "reason": reason},
-                )
-                if "requires explicit approval" in reason or "this action requires explicit approval" in reason:
-                    return self._terminal(LoopDecision.WAITING, "approval-required")
-                return self._terminal(LoopDecision.ESCALATE, "policy-denied")
+            if not reconciled:
+                try:
+                    capability = self.gate.authorize(
+                        intent,
+                        executor_id=self.executor.executor_id,
+                        approvals=approvals,
+                    )
+                except PolicyDenied as exc:
+                    reason = str(exc)
+                    self._history.append({"intent": intent.intent_digest, "failure": reason})
+                    self.ledger.append(
+                        "intent.denied",
+                        {"run_id": self.run_id, "intent_digest": intent.intent_digest, "reason": reason},
+                    )
+                    if "requires explicit approval" in reason or "this action requires explicit approval" in reason:
+                        return self._await_approval(iteration, intent, reason)
+                    return self._terminal(LoopDecision.ESCALATE, "policy-denied")
 
-            self._tool_calls += 1
-            # Persist before the effect starts. A process death after this
-            # transition is never retried by the controller; the executor's
-            # idempotency/supervisor record must be reconciled first.
-            self._checkpoint_pending_effect(iteration, intent)
-            self.ledger.append(
-                "execution.started",
-                {"run_id": self.run_id, "iteration": iteration, "intent_digest": intent.intent_digest},
-            )
-            binder = getattr(self.executor, "bind_run", None)
-            if callable(binder):
-                binder(self.run_id, self.contract.contract_digest)
-            observation = self.executor.execute(intent, capability)
-            execution_event_hash = self.ledger.append(
-                "execution.observed",
-                {
-                    "run_id": self.run_id,
-                    "intent_digest": intent.intent_digest,
-                    "capability_id": capability.capability_id,
-                    "executor_id": capability.executor_id,
-                    "success": observation.success,
-                    "exit_code": observation.exit_code,
-                    "artifact_digests": dict(observation.artifact_digests),
-                    "metadata": dict(observation.metadata),
-                },
-            )
+                self._tool_calls += 1
+                # Persist before the effect starts. A process death after this
+                # transition is never retried by the controller; the executor's
+                # idempotency/supervisor record must be reconciled first.
+                self._checkpoint_pending_effect(iteration, intent)
+                self.ledger.append(
+                    "execution.started",
+                    {"run_id": self.run_id, "iteration": iteration, "intent_digest": intent.intent_digest},
+                )
+                binder = getattr(self.executor, "bind_run", None)
+                if callable(binder):
+                    binder(self.run_id, self.contract.contract_digest)
+                observation = self.executor.execute(intent, capability)
+                execution_event_hash = self.ledger.append(
+                    "execution.observed",
+                    {
+                        "run_id": self.run_id,
+                        "intent_digest": intent.intent_digest,
+                        "capability_id": capability.capability_id,
+                        "executor_id": capability.executor_id,
+                        "success": observation.success,
+                        "exit_code": observation.exit_code,
+                        "artifact_digests": dict(observation.artifact_digests),
+                        "metadata": dict(observation.metadata),
+                    },
+                )
+            if self.evaluation_orchestrator is not None:
+                try:
+                    bundle = self.evaluation_orchestrator.evaluate(
+                        run_id=self.run_id,
+                        contract=self.contract,
+                        intent=intent,
+                        observation=observation,
+                    )
+                    existing_receipts = observation.metadata.get("evaluator_receipts", {})
+                    merged_receipts = (
+                        dict(existing_receipts) if isinstance(existing_receipts, Mapping) else {}
+                    )
+                    merged_receipts.update(bundle.evaluator_receipts)
+                    observation = replace(
+                        observation,
+                        metadata={
+                            **observation.metadata,
+                            "evaluator_receipts": merged_receipts,
+                            "workspace_snapshot_digest": bundle.workspace_snapshot.workspace_snapshot_digest,
+                            "workspace_snapshot_schema": bundle.workspace_snapshot.schema_version,
+                            "workspace_exclusion_policy_digest": bundle.workspace_snapshot.exclusion_policy_digest,
+                        },
+                    )
+                    self.ledger.append(
+                        "evaluation.completed",
+                        {
+                            "run_id": self.run_id,
+                            "intent_digest": intent.intent_digest,
+                            "workspace_snapshot_digest": bundle.workspace_snapshot.workspace_snapshot_digest,
+                            "receipt_types": sorted(bundle.evaluator_receipts),
+                        },
+                    )
+                except Exception as exc:
+                    self.ledger.append(
+                        "evaluation.unavailable",
+                        {
+                            "run_id": self.run_id,
+                            "intent_digest": intent.intent_digest,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
             try:
                 report = self.verifier.verify(
                     self.contract,
@@ -191,7 +271,13 @@ class VerifiedLoop:
                         ),
                     ),
                 )
-            if report.accepted and self.probe_runner is not None:
+            # Probes protect every action that could contribute to final
+            # completion, not just reports that already satisfy every task
+            # criterion. This closes the multi-step acceptance bypass.
+            if (
+                (report.accepted or self._safe_for_criterion_progress(observation, report))
+                and self.probe_runner is not None
+            ):
                 preaccept_probes = self._run_probes(
                     intent,
                     observation,
@@ -371,6 +457,12 @@ class VerifiedLoop:
             except ValueError as exc:
                 raise ValueError("persisted terminal decision is invalid") from exc
         if checkpoint.phase is RunPhase.PENDING_EFFECT:
+            self._save_checkpoint(
+                phase=RunPhase.RECONCILIATION_REQUIRED,
+                next_iteration=checkpoint.next_iteration,
+                pending_intent=checkpoint.pending_intent,
+                executor_id=checkpoint.executor_id,
+            )
             self.ledger.append(
                 "run.resume.blocked",
                 {
@@ -379,7 +471,17 @@ class VerifiedLoop:
                     "intent_digest": checkpoint.pending_intent.intent_digest if checkpoint.pending_intent else "",
                 },
             )
-            return self._terminal(LoopDecision.WAITING, "indeterminate-pending-effect")
+            return LoopDecision.WAITING
+        if checkpoint.phase is RunPhase.RECONCILIATION_REQUIRED:
+            self.ledger.append(
+                "run.resume.blocked",
+                {
+                    "run_id": self.run_id,
+                    "reason": "reconciliation-required",
+                    "intent_digest": checkpoint.pending_intent.intent_digest if checkpoint.pending_intent else "",
+                },
+            )
+            return LoopDecision.WAITING
         self.ledger.append(
             "run.resumed",
             {
@@ -396,6 +498,8 @@ class VerifiedLoop:
         phase: RunPhase,
         next_iteration: int,
         pending_intent: ActionIntent | None = None,
+        executor_id: str = "",
+        reconciled_observation: ExecutionObservation | None = None,
         terminal_decision: LoopDecision | None = None,
         terminal_reason: str | None = None,
     ) -> None:
@@ -413,6 +517,8 @@ class VerifiedLoop:
             seen_failures=tuple(sorted(self._seen_failures)),
             evidence=self._evidence.snapshot(),
             pending_intent=pending_intent,
+            executor_id=executor_id,
+            reconciled_observation=reconciled_observation,
             terminal_decision=terminal_decision.value if terminal_decision is not None else None,
             terminal_reason=terminal_reason,
             revision=self._checkpoint.revision,
@@ -424,6 +530,7 @@ class VerifiedLoop:
             phase=RunPhase.PENDING_AUTHORIZATION,
             next_iteration=iteration,
             pending_intent=intent,
+            executor_id=self.executor.executor_id,
         )
 
     def _checkpoint_pending_effect(self, iteration: int, intent: ActionIntent) -> None:
@@ -431,17 +538,102 @@ class VerifiedLoop:
             phase=RunPhase.PENDING_EFFECT,
             next_iteration=iteration,
             pending_intent=intent,
+            executor_id=self.executor.executor_id,
         )
 
     def _checkpoint_ready(self, next_iteration: int) -> None:
         self._save_checkpoint(phase=RunPhase.READY, next_iteration=next_iteration)
 
-    @staticmethod
-    def _safe_for_criterion_progress(
-        observation: ExecutionObservation, report: VerificationReport
-    ) -> bool:
-        """Separate action safety from incomplete whole-task evidence."""
+    def _await_approval(self, iteration: int, intent: ActionIntent, reason: str) -> LoopDecision:
+        """Persist the exact action as resumable reviewer work, not terminal state."""
 
+        self._save_checkpoint(
+            phase=RunPhase.AWAITING_APPROVAL,
+            next_iteration=iteration,
+            pending_intent=intent,
+            executor_id=self.executor.executor_id,
+        )
+        self.ledger.append(
+            "run.awaiting-approval",
+            {
+                "run_id": self.run_id,
+                "iteration": iteration,
+                "intent_digest": intent.intent_digest,
+                "executor_id": self.executor.executor_id,
+                "reason": reason,
+            },
+        )
+        return LoopDecision.WAITING
+
+    def resume_with_approval(self, approval: Approval | SignedApprovalReceipt) -> LoopDecision:
+        """Resume only the exact persisted intent after an external approval."""
+
+        if self.state_store is None:
+            raise RuntimeError("approval resume requires a durable run-state store")
+        checkpoint = self.state_store.load(self.run_id)
+        if checkpoint is None or checkpoint.phase is not RunPhase.AWAITING_APPROVAL:
+            raise RuntimeError("run is not awaiting approval")
+        return self.run((approval,))
+
+    def reconcile_effect(self) -> LoopDecision:
+        """Ask the deployment-owned reconciler for a signed effect outcome."""
+
+        if self.state_store is None or self.effect_reconciler is None:
+            raise RuntimeError("effect reconciliation requires durable state and a trusted reconciler")
+        checkpoint = self.state_store.load(self.run_id)
+        if checkpoint is None or checkpoint.phase is not RunPhase.RECONCILIATION_REQUIRED:
+            raise RuntimeError("run does not require effect reconciliation")
+        intent = checkpoint.pending_intent
+        assert intent is not None  # checkpoint invariant
+        observation = self.effect_reconciler.reconcile(
+            run_id=self.run_id,
+            contract=self.contract,
+            intent=intent,
+            executor_id=checkpoint.executor_id,
+        )
+        self._checkpoint = checkpoint
+        self._save_checkpoint(
+            phase=RunPhase.RECONCILED_EFFECT,
+            next_iteration=checkpoint.next_iteration,
+            pending_intent=intent,
+            executor_id=checkpoint.executor_id,
+            reconciled_observation=observation,
+        )
+        self.ledger.append(
+            "effect.reconciled",
+            {
+                "run_id": self.run_id,
+                "intent_digest": intent.intent_digest,
+                "executor_id": checkpoint.executor_id,
+                "success": observation.success,
+                "exit_code": observation.exit_code,
+            },
+        )
+        return self.run()
+
+    def cancel_run(self, *, reason: str = "cancelled-by-requester") -> LoopDecision:
+        """Explicitly stop a waiting/reconciliation run without replaying it."""
+
+        if self.state_store is not None:
+            checkpoint = self.state_store.load(self.run_id)
+            if checkpoint is not None:
+                self._checkpoint = checkpoint
+                self._tool_calls = checkpoint.tool_calls
+                self._history = list(checkpoint.history)
+                self._seen_failures = set(checkpoint.seen_failures)
+                self._evidence = EvidenceAccumulator.from_snapshot(checkpoint.evidence)
+        return self._terminal(LoopDecision.STOP, reason)
+
+    def _safe_for_criterion_progress(
+        self, observation: ExecutionObservation, report: VerificationReport
+    ) -> bool:
+        """Separate mandatory action safety from incomplete task criteria."""
+
+        # Older development contracts did not contain a reviewed safety set.
+        # Production contracts do, and only an all-PASS ActionSafetyReport may
+        # contribute evidence there.
+        if self.contract.action_safety_checks:
+            return ActionSafetyReport.from_report(self.contract, report).accepted
         structural = next((check for check in report.checks if check.name == "structural"), None)
         return (
             observation.success
@@ -660,12 +852,21 @@ class VerifiedLoop:
             )
             return
         try:
+            snapshot = self._evidence.snapshot()
+            completion_report = TaskCompletionReport(
+                action_reports=tuple(action.report for action in snapshot.actions),
+                final_check=final_check,
+                final_workspace_digest=snapshot.final_source_state_digest,
+            )
+            complete_evidence_refs = tuple(
+                dict.fromkeys((*self.ledger.event_hashes_for_run(self.run_id), *evidence_refs))
+            )
             candidate = self.memory_candidate_producer.propose(
                 contract=self.contract,
                 history=tuple(self._history),
-                report=report,
+                report=completion_report,
                 final_check=final_check,
-                available_evidence_refs=evidence_refs,
+                available_evidence_refs=complete_evidence_refs,
             )
             if candidate is None:
                 self.ledger.append(
@@ -675,10 +876,10 @@ class VerifiedLoop:
                 return
             record = self.memory_committer.commit(
                 candidate,
-                report=report,
+                report=completion_report,
                 final_check=final_check,
                 source_run_id=self.run_id,
-                available_evidence_refs=evidence_refs,
+                available_evidence_refs=complete_evidence_refs,
             )
             self.ledger.append(
                 "memory.committed",

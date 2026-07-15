@@ -145,11 +145,16 @@ class FirecrackerSupervisorHTTPClient:
     name: str = "firecracker-supervisor"
 
     def run(self, launch: FirecrackerLaunch) -> GuestExecutionResult:
+        if not launch.remote_asset_request:
+            raise RemoteServiceError("remote Firecracker jobs require opaque asset identities")
         response = self.client.post(
             self.endpoint,
             {
                 "job_id": launch.job_id,
-                "config": dict(launch.config),
+                # The privileged service resolves its own allowlisted asset
+                # IDs and creates the writable job drive itself. Never send
+                # controller-visible kernel/rootfs/drive paths over the API.
+                "asset_request": dict(launch.remote_asset_request),
                 "manifest": dict(launch.manifest),
                 "config_digest": launch.config_digest,
                 "manifest_digest": launch.manifest_digest,

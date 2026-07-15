@@ -301,6 +301,17 @@ class EvidenceLedger:
             for row in rows
         }
 
+    def event_hashes_for_run(self, run_id: str) -> tuple[str, ...]:
+        """Return every immutable event explicitly bound to one controller run."""
+
+        if not run_id.strip():
+            raise ValueError("run id is required")
+        return tuple(
+            event["event_hash"]
+            for event in self.events()
+            if event["payload"].get("run_id") == run_id
+        )
+
     def verify_chain(self) -> bool:
         parent_hash = "0" * 64
         for event in self.events():

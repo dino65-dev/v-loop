@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Callable, Iterable, Protocol
 
+from .canonical import digest
 from .models import ActionIntent, CheckResult, CheckStatus, ExecutionObservation, TaskContract, VerificationReport
 
 
@@ -83,16 +84,29 @@ class ProbeReport:
 class ProtectedProbeRunner:
     """Runs pre-registered probes selected from hard verifier categories."""
 
-    def __init__(self, probes: Iterable[ProtectedProbe]) -> None:
+    def __init__(self, probes: Iterable[ProtectedProbe], *, policy_id: str = "") -> None:
         registered = tuple(probes)
         ids = [probe.definition.probe_id for probe in registered]
         if len(ids) != len(set(ids)):
             raise ValueError("probe ids must be unique")
+        if policy_id and not policy_id.strip():
+            raise ValueError("probe policy id must be non-empty when supplied")
         self._probes = registered
+        self._policy_id = policy_id
 
     @property
     def definitions(self) -> tuple[ProbeDefinition, ...]:
         return tuple(probe.definition for probe in self._probes)
+
+    @property
+    def policy_id(self) -> str:
+        """Reviewed identity used by a production task profile."""
+
+        return self._policy_id
+
+    @property
+    def policy_digest(self) -> str:
+        return digest({"probe_policy_id": self._policy_id}) if self._policy_id else ""
 
     def run(
         self,

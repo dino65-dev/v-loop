@@ -142,7 +142,14 @@ class TaskContract:
     forbidden_actions: tuple[str, ...] = ()
     required_verifiers: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     success_condition_bindings: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    action_safety_checks: tuple[str, ...] = ()
+    global_completion_guards: tuple[str, ...] = ()
     require_argument_provenance: bool = False
+    task_kind: str = ""
+    risk_class: str = ""
+    probe_policy_digest: str = ""
+    profile_version: str = ""
+    profile_digest: str = ""
     maximum_iterations: int = 8
     maximum_tool_calls: int = 32
     expires_at: datetime | None = None
@@ -179,6 +186,21 @@ class TaskContract:
                 raise ValueError("success condition bindings need non-empty check names")
         if not isinstance(self.require_argument_provenance, bool):
             raise ValueError("require_argument_provenance must be a boolean")
+        for label, names in (
+            ("action safety checks", self.action_safety_checks),
+            ("global completion guards", self.global_completion_guards),
+        ):
+            if len(names) != len(set(names)) or any(not name.strip() for name in names):
+                raise ValueError(f"{label} must contain unique non-empty names")
+        profile_fields = (
+            self.task_kind,
+            self.risk_class,
+            self.probe_policy_digest,
+            self.profile_version,
+            self.profile_digest,
+        )
+        if any(profile_fields) and not all(profile_fields):
+            raise ValueError("task profile metadata must be complete when present")
 
     @property
     def contract_digest(self) -> str:

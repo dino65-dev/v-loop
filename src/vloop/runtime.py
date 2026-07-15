@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from .authorization import SQLiteNonceStore
 from .completion import FinalVerifier
+from .evaluation import ProtectedEvaluationOrchestrator
 from .executor import CapabilityEnforcingExecutor, SQLiteIdempotencyStore
 from .firecracker import FirecrackerExecutor
 from .models import TaskContract
@@ -56,6 +57,7 @@ class ProductionRuntime:
     gate: PolicyGate
     state_store: SQLiteRunStateStore
     ledger_anchor: LedgerAnchorHTTPClient
+    evaluation_orchestrator: ProtectedEvaluationOrchestrator
 
     def validate(self) -> None:
         """Revalidate mutable component internals immediately before startup."""
@@ -69,6 +71,7 @@ class ProductionRuntime:
             gate=self.gate,
             state_store=self.state_store,
             ledger_anchor=self.ledger_anchor,
+            evaluation_orchestrator=self.evaluation_orchestrator,
         ).validate()
 
     def create_loop(self, *, planner, ledger, **kwargs):
@@ -100,6 +103,7 @@ class ProductionRuntime:
             final_verifier=self.final_verifier,
             probe_runner=self.probe_runner,
             state_store=self.state_store,
+            evaluation_orchestrator=self.evaluation_orchestrator,
             **kwargs,
         )
 
@@ -123,6 +127,7 @@ class ProductionRuntimeBuilder:
     gate: PolicyGate | None = None
     state_store: SQLiteRunStateStore | None = None
     ledger_anchor: LedgerAnchorHTTPClient | None = None
+    evaluation_orchestrator: ProtectedEvaluationOrchestrator | None = None
 
     def validate(self) -> None:
         failures: list[str] = []
@@ -138,13 +143,18 @@ class ProductionRuntimeBuilder:
             else:
                 if not isinstance(self.executor.raw_executor.supervisor, FirecrackerSupervisorHTTPClient):
                     failures.append("Firecracker requires an authenticated remote supervisor client")
+                elif not self.executor.raw_executor.remote_asset_request:
+                    failures.append("remote Firecracker requires opaque registered asset identities")
                 supervisor = self.executor.raw_executor.supervisor_receipt_verifier
                 if supervisor is None or supervisor.policy is None:
                     failures.append("Firecracker requires a policy-bound supervisor receipt verifier")
                 elif not supervisor.has_verifier_owned_trust:
                     failures.append("Firecracker supervisor receipt verifier needs key lifecycle trust")
-                elif supervisor.policy.workspace_snapshot_schema is None:
-                    failures.append("Firecracker supervisor receipts need a canonical workspace snapshot schema")
+                elif (
+                    supervisor.policy.workspace_snapshot_schema is None
+                    or not supervisor.policy.workspace_exclusion_policy_digests
+                ):
+                    failures.append("Firecracker supervisor receipts need a canonical snapshot schema and exclusion policy")
 
         if self.final_verifier is None:
             failures.append("a final verifier is required")
@@ -152,6 +162,8 @@ class ProductionRuntimeBuilder:
             failures.append("contract needs immutable success-condition bindings")
         elif getattr(self.final_verifier, "required_checks", None) != dict(self.contract.success_condition_bindings):
             failures.append("final verifier does not match the contract success-condition bindings")
+        elif getattr(self.final_verifier, "global_completion_guards", None) != self.contract.global_completion_guards:
+            failures.append("final verifier does not match the contract global completion guards")
         if self.gate is None or self.gate.signed_approval_verifier is None:
             failures.append("a policy gate with signed approval verification is required")
         elif not self.gate.signed_approval_verifier.has_verifier_owned_trust:
@@ -168,16 +180,36 @@ class ProductionRuntimeBuilder:
             failures.append("policy gate and runtime use different contracts")
         if self.probe_runner is None or not self.probe_runner.definitions:
             failures.append("a non-empty protected probe policy is required")
+        elif self.probe_runner.policy_digest != self.contract.probe_policy_digest:
+            failures.append("protected probe policy does not match the task-profile digest")
         if not isinstance(self.state_store, SQLiteRunStateStore):
             failures.append("a durable SQLite controller run-state store is required")
         if not isinstance(self.ledger_anchor, LedgerAnchorHTTPClient):
             failures.append("an authenticated external ledger-anchor client is required")
+        if not isinstance(self.evaluation_orchestrator, ProtectedEvaluationOrchestrator):
+            failures.append("a protected evaluator orchestrator is required")
 
         required = self.contract.required_verifiers
         if any(rule.allow_unlisted_arguments for rule in self.contract.allowed_actions):
             failures.append("production action rules must use closed argument schemas")
         if not self.contract.require_argument_provenance:
             failures.append("production contracts must require per-argument provenance DAGs")
+        if not all(
+            (
+                self.contract.task_kind,
+                self.contract.risk_class,
+                self.contract.probe_policy_digest,
+                self.contract.profile_version,
+                self.contract.profile_digest,
+            )
+        ):
+            failures.append("production contracts need immutable task-profile metadata")
+        if not self.contract.action_safety_checks:
+            failures.append("production contracts need mandatory action-safety checks")
+        if not self.contract.global_completion_guards:
+            failures.append("production contracts need global completion guards")
+        elif not set(self.contract.action_safety_checks).issubset(self.contract.global_completion_guards):
+            failures.append("mandatory action-safety checks must also be global completion guards")
         for category in ("correctness", "policy", "evidence", "quality"):
             if not required.get(category):
                 failures.append(f"contract requires at least one {category} verifier")
@@ -194,7 +226,14 @@ class ProductionRuntimeBuilder:
         if any(isinstance(check, development_types) for check in checks):
             failures.append("development metadata verifiers are forbidden in production")
 
-        registered = {getattr(check, "name", ""): check for check in checks}
+        # Most verifier implementations expose their stable result name as
+        # ``name``.  StructuralVerifier is intentionally stateless, so make
+        # its protocol name explicit rather than relying on an implementation
+        # attribute that it does not need at execution time.
+        registered = {
+            ("structural" if isinstance(check, StructuralVerifier) else getattr(check, "name", "")): check
+            for check in checks
+        }
         for category, names in required.items():
             for name in names:
                 check = registered.get(name)
@@ -204,6 +243,37 @@ class ProductionRuntimeBuilder:
                     failures.append(f"required verifier {name!r} lacks an immutable receipt policy")
                 elif not check.receipt_verifier.has_verifier_owned_trust:
                     failures.append(f"required verifier {name!r} lacks verifier-owned key lifecycle trust")
+                elif not check.receipt_verifier.policy.workspace_exclusion_policy_digests:
+                    failures.append(f"required verifier {name!r} lacks an approved snapshot exclusion policy")
+        if isinstance(self.evaluation_orchestrator, ProtectedEvaluationOrchestrator):
+            required_evaluator_checks = {
+                name
+                for names in required.values()
+                for name in names
+                if isinstance(registered.get(name), SignedReceiptVerifier)
+            }
+            if not required_evaluator_checks.issubset(self.evaluation_orchestrator.check_names):
+                failures.append("protected evaluator orchestration does not cover every required receipt check")
+
+        bound_checks = {
+            name for names in self.contract.success_condition_bindings.values() for name in names
+        }.union(self.contract.global_completion_guards)
+        required_names = {name for names in required.values() for name in names}
+        if not required_names.issubset(bound_checks):
+            failures.append("all contract-required verifiers must bind to final criteria or global guards")
+        if not set(self.contract.action_safety_checks).issubset(registered):
+            failures.append("mandatory action-safety checks are not registered")
+        available_completion_guards = set(registered).union(
+            {f"probe:{definition.probe_id}" for definition in self.probe_runner.definitions}
+            if self.probe_runner is not None
+            else set()
+        )
+        if not set(self.contract.global_completion_guards).issubset(available_completion_guards):
+            failures.append("global completion guards are not registered checks or protected probes")
+        if self.probe_runner is not None:
+            required_probe_guards = {f"probe:{definition.probe_id}" for definition in self.probe_runner.definitions}
+            if not required_probe_guards.issubset(self.contract.global_completion_guards):
+                failures.append("every production protected probe must be a global completion guard")
 
         if failures:
             raise ProductionConfigurationError("production runtime rejected: " + "; ".join(failures))
@@ -212,8 +282,13 @@ class ProductionRuntimeBuilder:
             if isinstance(check, SignedReceiptVerifier) and check.receipt_verifier.policy is not None:
                 if check.receipt_verifier.policy.minimum_schema_version < 2:
                     raise ProductionConfigurationError("production receipts must require schema v2")
-                if check.receipt_verifier.policy.workspace_snapshot_schema is None:
-                    raise ProductionConfigurationError("production receipts must require a canonical workspace snapshot schema")
+                if (
+                    check.receipt_verifier.policy.workspace_snapshot_schema is None
+                    or not check.receipt_verifier.policy.workspace_exclusion_policy_digests
+                ):
+                    raise ProductionConfigurationError(
+                        "production receipts must require a canonical snapshot schema and exclusion policy"
+                    )
 
     def build(self) -> ProductionRuntime:
         """Return a frozen deployment recipe only after all checks pass."""
@@ -225,6 +300,7 @@ class ProductionRuntimeBuilder:
         assert self.gate is not None
         assert self.state_store is not None
         assert self.ledger_anchor is not None
+        assert self.evaluation_orchestrator is not None
         return ProductionRuntime(
             contract=self.contract,
             executor=self.executor,
@@ -234,4 +310,5 @@ class ProductionRuntimeBuilder:
             gate=self.gate,
             state_store=self.state_store,
             ledger_anchor=self.ledger_anchor,
+            evaluation_orchestrator=self.evaluation_orchestrator,
         )

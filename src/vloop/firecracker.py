@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Mapping, Protocol
 from uuid import uuid4
 
 from .canonical import digest
@@ -163,9 +163,22 @@ class FirecrackerSupervisorPlan:
 
 @dataclass(frozen=True, slots=True)
 class FirecrackerAssets:
+    """Local supervisor assets plus opaque identities for remote execution.
+
+    Paths are used only by an in-process/test supervisor.  A remote privileged
+    supervisor receives ``remote_asset_request`` and resolves these reviewed
+    identifiers from its own registry; it never receives controller paths.
+    """
+
     kernel_image: Path
     rootfs: Path
     job_drive: Path
+    kernel_image_id: str = ""
+    kernel_image_digest: str = ""
+    rootfs_image_id: str = ""
+    rootfs_digest: str = ""
+    resource_profile_id: str = ""
+    workspace_snapshot_id: str = ""
 
     def validate(self) -> None:
         for label, path in (
@@ -177,6 +190,26 @@ class FirecrackerAssets:
                 raise FirecrackerConfigurationError(
                     f"{label} must be an absolute regular non-symlink file"
                 )
+
+    @property
+    def remote_asset_request(self) -> Mapping[str, str]:
+        """The complete allowlisted identity tuple required by a remote service."""
+
+        values = {
+            "kernel_image_id": self.kernel_image_id,
+            "kernel_image_digest": self.kernel_image_digest,
+            "rootfs_image_id": self.rootfs_image_id,
+            "rootfs_digest": self.rootfs_digest,
+            "resource_profile_id": self.resource_profile_id,
+            "workspace_snapshot_id": self.workspace_snapshot_id,
+        }
+        if not all(value.strip() for value in values.values()):
+            return {}
+        for digest_field in ("kernel_image_digest", "rootfs_digest"):
+            value = values[digest_field]
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise FirecrackerConfigurationError(f"{digest_field} must be a SHA-256 hex digest")
+        return values
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +234,7 @@ class FirecrackerLaunch:
     manifest: Mapping[str, Any]
     config_digest: str
     manifest_digest: str
+    remote_asset_request: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +327,7 @@ class FirecrackerJobBuilder:
             manifest=manifest,
             config_digest=digest(config),
             manifest_digest=digest(manifest),
+            remote_asset_request=self.assets.remote_asset_request,
         )
 
 
@@ -320,6 +355,12 @@ class FirecrackerExecutor:
         """The narrow service client; it never grants host VM authority."""
 
         return self._supervisor
+
+    @property
+    def remote_asset_request(self) -> Mapping[str, str]:
+        """Reviewed asset identities available to a remote supervisor."""
+
+        return self._builder.assets.remote_asset_request
 
     def bind_run(self, run_id: str, contract_digest: str | None = None) -> None:
         self._run_id = run_id

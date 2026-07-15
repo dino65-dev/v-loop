@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from .canonical import canonical_json, digest
+from .completion import TaskCompletionReport
 from .ledger import EvidenceLedger
 from .models import CheckResult, CheckStatus, TaskContract, VerificationReport
 
@@ -60,7 +61,7 @@ class MemoryWriteGate:
     def promote(
         self,
         candidate: MemoryCandidate,
-        report: VerificationReport,
+        report: VerificationReport | TaskCompletionReport,
         *,
         source_run_id: str,
         now: datetime | None = None,
@@ -927,7 +928,7 @@ class MemoryCandidateProducer(Protocol):
         *,
         contract: TaskContract,
         history: tuple[dict, ...],
-        report: VerificationReport,
+        report: TaskCompletionReport,
         final_check: CheckResult,
         available_evidence_refs: tuple[str, ...],
     ) -> MemoryCandidate | None: ...
@@ -955,7 +956,7 @@ class VerifiedMemoryCommitter:
         self,
         candidate: MemoryCandidate,
         *,
-        report: VerificationReport,
+        report: TaskCompletionReport,
         final_check: CheckResult,
         source_run_id: str,
         available_evidence_refs: tuple[str, ...],

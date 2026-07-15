@@ -25,6 +25,7 @@ from .models import (
     CheckResult,
     CheckStatus,
     Effect,
+    ExecutionObservation,
     Provenance,
     VerificationReport,
 )
@@ -34,6 +35,9 @@ class RunPhase(StrEnum):
     READY = "ready"
     PENDING_AUTHORIZATION = "pending-authorization"
     PENDING_EFFECT = "pending-effect"
+    AWAITING_APPROVAL = "awaiting-approval"
+    RECONCILIATION_REQUIRED = "reconciliation-required"
+    RECONCILED_EFFECT = "reconciled-effect"
     TERMINAL = "terminal"
 
 
@@ -52,6 +56,8 @@ class RunCheckpoint:
     seen_failures: tuple[tuple[str, str], ...]
     evidence: EvidenceSnapshot
     pending_intent: ActionIntent | None = None
+    executor_id: str = ""
+    reconciled_observation: ExecutionObservation | None = None
     terminal_decision: str | None = None
     terminal_reason: str | None = None
     revision: int = 0
@@ -64,11 +70,24 @@ class RunCheckpoint:
             raise ValueError("run checkpoint counters are invalid")
         if self.evidence.run_id != self.run_id:
             raise ValueError("run checkpoint evidence belongs to another run")
-        if self.phase in {RunPhase.PENDING_AUTHORIZATION, RunPhase.PENDING_EFFECT}:
+        pending_phases = {
+            RunPhase.PENDING_AUTHORIZATION,
+            RunPhase.PENDING_EFFECT,
+            RunPhase.AWAITING_APPROVAL,
+            RunPhase.RECONCILIATION_REQUIRED,
+            RunPhase.RECONCILED_EFFECT,
+        }
+        if self.phase in pending_phases:
             if self.pending_intent is None:
                 raise ValueError("pending run checkpoints need their exact intent")
-        elif self.pending_intent is not None:
+            if not self.executor_id.strip():
+                raise ValueError("pending run checkpoints need their intended executor")
+        elif self.pending_intent is not None or self.executor_id:
             raise ValueError("only a pending checkpoint may retain an intent")
+        if self.phase is RunPhase.RECONCILED_EFFECT and self.reconciled_observation is None:
+            raise ValueError("reconciled effects need an attested observation")
+        if self.phase is not RunPhase.RECONCILED_EFFECT and self.reconciled_observation is not None:
+            raise ValueError("only reconciled effects may retain an observation")
         if self.phase is RunPhase.TERMINAL:
             if not self.terminal_decision or not self.terminal_reason:
                 raise ValueError("terminal checkpoints need a decision and reason")
@@ -103,6 +122,8 @@ class SQLiteRunStateStore:
                 seen_failures_json TEXT NOT NULL,
                 evidence_json TEXT NOT NULL,
                 pending_intent_json TEXT,
+                executor_id TEXT,
+                reconciled_observation_json TEXT,
                 terminal_decision TEXT,
                 terminal_reason TEXT,
                 revision INTEGER NOT NULL,
@@ -110,12 +131,20 @@ class SQLiteRunStateStore:
             )
             """
         )
+        existing = {row[1] for row in self._connection.execute("PRAGMA table_info(run_checkpoints)").fetchall()}
+        for column, declaration in (
+            ("executor_id", "TEXT"),
+            ("reconciled_observation_json", "TEXT"),
+        ):
+            if column not in existing:
+                self._connection.execute(f"ALTER TABLE run_checkpoints ADD COLUMN {column} {declaration}")
 
     def load(self, run_id: str) -> RunCheckpoint | None:
         row = self._connection.execute(
             """
             SELECT contract_digest, phase, next_iteration, tool_calls, history_json,
-                   seen_failures_json, evidence_json, pending_intent_json,
+                   seen_failures_json, evidence_json, pending_intent_json, executor_id,
+                   reconciled_observation_json,
                    terminal_decision, terminal_reason, revision, updated_at
             FROM run_checkpoints WHERE run_id = ?
             """,
@@ -133,10 +162,12 @@ class SQLiteRunStateStore:
             seen_failures=tuple(tuple(item) for item in json.loads(row[5])),
             evidence=_decode_evidence(run_id, json.loads(row[6])),
             pending_intent=_decode_intent(json.loads(row[7])) if row[7] else None,
-            terminal_decision=row[8],
-            terminal_reason=row[9],
-            revision=int(row[10]),
-            updated_at=datetime.fromisoformat(row[11]),
+            executor_id=row[8] or "",
+            reconciled_observation=_decode_observation(json.loads(row[9])) if row[9] else None,
+            terminal_decision=row[10],
+            terminal_reason=row[11],
+            revision=int(row[12]),
+            updated_at=datetime.fromisoformat(row[13]),
         )
 
     def save(self, checkpoint: RunCheckpoint) -> RunCheckpoint:
@@ -149,6 +180,10 @@ class SQLiteRunStateStore:
             canonical_json(checkpoint.seen_failures),
             canonical_json(_encode_evidence(checkpoint.evidence)),
             canonical_json(_encode_intent(checkpoint.pending_intent)) if checkpoint.pending_intent else None,
+            checkpoint.executor_id or None,
+            canonical_json(_encode_observation(checkpoint.reconciled_observation))
+            if checkpoint.reconciled_observation
+            else None,
             checkpoint.terminal_decision,
             checkpoint.terminal_reason,
         )
@@ -167,8 +202,9 @@ class SQLiteRunStateStore:
                     INSERT INTO run_checkpoints (
                         run_id, contract_digest, phase, next_iteration, tool_calls,
                         history_json, seen_failures_json, evidence_json, pending_intent_json,
-                        terminal_decision, terminal_reason, revision, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        executor_id, reconciled_observation_json, terminal_decision, terminal_reason,
+                        revision, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (checkpoint.run_id, *encoded, revision, now.isoformat()),
                 )
@@ -181,7 +217,8 @@ class SQLiteRunStateStore:
                     UPDATE run_checkpoints
                     SET contract_digest = ?, phase = ?, next_iteration = ?, tool_calls = ?,
                         history_json = ?, seen_failures_json = ?, evidence_json = ?,
-                        pending_intent_json = ?, terminal_decision = ?, terminal_reason = ?,
+                        pending_intent_json = ?, executor_id = ?, reconciled_observation_json = ?,
+                        terminal_decision = ?, terminal_reason = ?,
                         revision = ?, updated_at = ?
                     WHERE run_id = ? AND revision = ?
                     """,
@@ -203,6 +240,8 @@ class SQLiteRunStateStore:
             seen_failures=checkpoint.seen_failures,
             evidence=checkpoint.evidence,
             pending_intent=checkpoint.pending_intent,
+            executor_id=checkpoint.executor_id,
+            reconciled_observation=checkpoint.reconciled_observation,
             terminal_decision=checkpoint.terminal_decision,
             terminal_reason=checkpoint.terminal_reason,
             revision=revision,
@@ -310,6 +349,28 @@ def _decode_report(value: Mapping[str, Any]) -> VerificationReport:
             )
             for check in value["checks"]
         ),
+    )
+
+
+def _encode_observation(observation: ExecutionObservation) -> dict[str, Any]:
+    return {
+        "success": observation.success,
+        "exit_code": observation.exit_code,
+        "stdout": observation.stdout,
+        "stderr": observation.stderr,
+        "artifact_digests": dict(observation.artifact_digests),
+        "metadata": dict(observation.metadata),
+    }
+
+
+def _decode_observation(value: Mapping[str, Any]) -> ExecutionObservation:
+    return ExecutionObservation(
+        success=bool(value["success"]),
+        exit_code=value["exit_code"],
+        stdout=str(value["stdout"]),
+        stderr=str(value["stderr"]),
+        artifact_digests=dict(value["artifact_digests"]),
+        metadata=dict(value["metadata"]),
     )
 
 

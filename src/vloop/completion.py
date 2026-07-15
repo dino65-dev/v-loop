@@ -90,6 +90,45 @@ class EvidenceAccumulator:
         return accumulator
 
 
+@dataclass(frozen=True, slots=True)
+class ActionSafetyReport:
+    """Non-negotiable gates that permit an action to add task evidence."""
+
+    required_checks: tuple[str, ...]
+    statuses: Mapping[str, CheckStatus]
+
+    @property
+    def accepted(self) -> bool:
+        return bool(self.required_checks) and all(
+            self.statuses.get(name) is CheckStatus.PASS for name in self.required_checks
+        )
+
+    @classmethod
+    def from_report(cls, contract: TaskContract, report: VerificationReport) -> "ActionSafetyReport":
+        statuses: dict[str, CheckStatus] = {}
+        for check in report.checks:
+            prior = statuses.get(check.name)
+            statuses[check.name] = (
+                CheckStatus.INCONCLUSIVE
+                if prior is not None and prior is not check.status
+                else check.status
+            )
+        return cls(contract.action_safety_checks, statuses)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskCompletionReport:
+    """Aggregate, whole-task evidence used for post-acceptance side effects."""
+
+    action_reports: tuple[VerificationReport, ...]
+    final_check: CheckResult
+    final_workspace_digest: str | None
+
+    @property
+    def accepted(self) -> bool:
+        return self.final_check.status is CheckStatus.PASS
+
+
 class FinalVerifier(Protocol):
     """Protected evaluator for whole-task completion."""
 
@@ -112,18 +151,27 @@ class RequiredChecksFinalVerifier:
     with a protected evaluator that performs a broader end-to-end check.
     """
 
-    def __init__(self, required_checks: Mapping[str, tuple[str, ...]]) -> None:
+    def __init__(
+        self,
+        required_checks: Mapping[str, tuple[str, ...]],
+        global_completion_guards: tuple[str, ...] = (),
+    ) -> None:
         self._required_checks = {condition: tuple(names) for condition, names in required_checks.items()}
+        self._global_completion_guards = tuple(global_completion_guards)
 
     @property
     def required_checks(self) -> Mapping[str, tuple[str, ...]]:
         return dict(self._required_checks)
 
+    @property
+    def global_completion_guards(self) -> tuple[str, ...]:
+        return self._global_completion_guards
+
     @classmethod
     def from_contract(cls, contract: TaskContract) -> "RequiredChecksFinalVerifier":
         if not contract.success_condition_bindings:
             raise ValueError("contract has no immutable success-condition bindings")
-        return cls(contract.success_condition_bindings)
+        return cls(contract.success_condition_bindings, contract.global_completion_guards)
 
     def verify(
         self,
@@ -147,6 +195,13 @@ class RequiredChecksFinalVerifier:
             statuses = {name: check_statuses.get(name, CheckStatus.INCONCLUSIVE).value for name in names}
             if any(status != CheckStatus.PASS.value for status in statuses.values()):
                 failed_conditions[condition] = statuses
+        guard_statuses = {
+            name: check_statuses.get(name, CheckStatus.INCONCLUSIVE).value
+            for name in self._global_completion_guards
+        }
+        failed_guards = {
+            name: status for name, status in guard_statuses.items() if status != CheckStatus.PASS.value
+        }
 
         payload = {
             "contract_digest": contract.contract_digest,
@@ -154,6 +209,7 @@ class RequiredChecksFinalVerifier:
             "missing_bindings": tuple(missing_bindings),
             "unknown_conditions": tuple(unknown_conditions),
             "condition_statuses": failed_conditions,
+            "global_guard_statuses": guard_statuses,
         }
         if missing_bindings or unknown_conditions:
             return CheckResult(
@@ -162,12 +218,12 @@ class RequiredChecksFinalVerifier:
                 payload,
                 "each success condition needs an explicit protected check binding",
             )
-        if not evidence.actions or failed_conditions:
+        if not evidence.actions or failed_conditions or failed_guards:
             return CheckResult(
                 "final-goal",
                 CheckStatus.FAIL,
                 payload,
-                "a bound final check did not pass",
+                "a bound final check or global completion guard did not pass",
             )
         return CheckResult("final-goal", CheckStatus.PASS, payload)
 

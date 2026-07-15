@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
+from .canonical import digest
 from .models import ActionRule, ArgumentRule, Effect, TaskContract
 
 
@@ -48,6 +49,9 @@ class TaskProfile:
     probe_policy_id: str
     risk_class: str
     require_argument_provenance: bool = True
+    action_safety_checks: tuple[str, ...] = ("structural",)
+    global_completion_guards: tuple[str, ...] = ("structural",)
+    profile_version: str = "1"
 
     def __post_init__(self) -> None:
         if not all((self.task_kind, self.probe_policy_id, self.risk_class)):
@@ -56,6 +60,24 @@ class TaskProfile:
             raise ValueError("task profile needs authorities, verifier requirements, and success bindings")
         if not isinstance(self.require_argument_provenance, bool):
             raise ValueError("task profile provenance requirement must be a boolean")
+        if not self.profile_version.strip():
+            raise ValueError("task profile version is required")
+        for label, checks in (
+            ("action safety checks", self.action_safety_checks),
+            ("global completion guards", self.global_completion_guards),
+        ):
+            if not checks or len(checks) != len(set(checks)) or any(not check.strip() for check in checks):
+                raise ValueError(f"task profile {label} must be unique and non-empty")
+        if not set(self.action_safety_checks).issubset(self.global_completion_guards):
+            raise ValueError("task profile action safety checks must be global completion guards")
+
+    @property
+    def probe_policy_digest(self) -> str:
+        return digest({"probe_policy_id": self.probe_policy_id})
+
+    @property
+    def profile_digest(self) -> str:
+        return digest(self)
 
 
 class ContractCompilationError(ValueError):
@@ -121,6 +143,17 @@ class TaskContractCompiler:
             require_argument_provenance=(
                 self._profile.require_argument_provenance if self._profile is not None else False
             ),
+            action_safety_checks=(
+                self._profile.action_safety_checks if self._profile is not None else ()
+            ),
+            global_completion_guards=(
+                self._profile.global_completion_guards if self._profile is not None else ()
+            ),
+            task_kind=self._profile.task_kind if self._profile is not None else "",
+            risk_class=self._profile.risk_class if self._profile is not None else "",
+            probe_policy_digest=self._profile.probe_policy_digest if self._profile is not None else "",
+            profile_version=self._profile.profile_version if self._profile is not None else "",
+            profile_digest=self._profile.profile_digest if self._profile is not None else "",
             maximum_iterations=request.maximum_iterations,
             maximum_tool_calls=request.maximum_tool_calls,
         )

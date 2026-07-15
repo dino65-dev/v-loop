@@ -7,7 +7,7 @@ dependencies = ["cryptography>=42.0"]
 
 [project.optional-dependencies]
 model = ["openai>=1.0"]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.15", "bandit>=1.9", "pip-audit>=2.10"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

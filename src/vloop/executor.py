@@ -34,11 +34,11 @@ class RawExecutor(Protocol):
 
 
 class IdempotencyStore(Protocol):
-    def reserve(self, key: tuple[str, str, str]) -> tuple[str, ExecutionObservation | None]: ...
+    def reserve(self, key: tuple[str, str, str, str]) -> tuple[str, ExecutionObservation | None]: ...
 
-    def complete(self, key: tuple[str, str, str], observation: ExecutionObservation) -> None: ...
+    def complete(self, key: tuple[str, str, str, str], observation: ExecutionObservation) -> None: ...
 
-    def mark_indeterminate(self, key: tuple[str, str, str], observation: ExecutionObservation) -> None: ...
+    def mark_indeterminate(self, key: tuple[str, str, str, str], observation: ExecutionObservation) -> None: ...
 
 
 class InMemoryIdempotencyStore:
@@ -46,12 +46,18 @@ class InMemoryIdempotencyStore:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._records: dict[tuple[str, str, str], ExecutionObservation | None] = {}
-        self._indeterminate: set[tuple[str, str, str]] = set()
+        self._records: dict[tuple[str, str, str, str], ExecutionObservation | None] = {}
+        self._intent_by_operation: dict[tuple[str, str, str], str] = {}
+        self._indeterminate: set[tuple[str, str, str, str]] = set()
 
-    def reserve(self, key: tuple[str, str, str]) -> tuple[str, ExecutionObservation | None]:
+    def reserve(self, key: tuple[str, str, str, str]) -> tuple[str, ExecutionObservation | None]:
         with self._lock:
+            operation_key, intent_digest = key[:3], key[3]
+            existing_intent = self._intent_by_operation.get(operation_key)
+            if existing_intent is not None and existing_intent != intent_digest:
+                return "conflict", None
             if key not in self._records:
+                self._intent_by_operation[operation_key] = intent_digest
                 self._records[key] = None
                 return "reserved", None
             if key in self._indeterminate:
@@ -59,11 +65,11 @@ class InMemoryIdempotencyStore:
             record = self._records[key]
             return ("pending", None) if record is None else ("completed", record)
 
-    def complete(self, key: tuple[str, str, str], observation: ExecutionObservation) -> None:
+    def complete(self, key: tuple[str, str, str, str], observation: ExecutionObservation) -> None:
         with self._lock:
             self._records[key] = observation
 
-    def mark_indeterminate(self, key: tuple[str, str, str], observation: ExecutionObservation) -> None:
+    def mark_indeterminate(self, key: tuple[str, str, str, str], observation: ExecutionObservation) -> None:
         with self._lock:
             self._records[key] = observation
             self._indeterminate.add(key)
@@ -88,10 +94,11 @@ class SQLiteIdempotencyStore:
         self._lease_duration = lease_duration
         self._connection.execute(
             """
-            CREATE TABLE IF NOT EXISTS executor_idempotency (
+            CREATE TABLE IF NOT EXISTS executor_idempotency_v3 (
                 executor_id TEXT NOT NULL,
                 contract_digest TEXT NOT NULL,
                 idempotency_key TEXT NOT NULL,
+                intent_digest TEXT NOT NULL,
                 state TEXT NOT NULL,
                 observation_json TEXT,
                 owner_id TEXT,
@@ -103,21 +110,8 @@ class SQLiteIdempotencyStore:
             )
             """
         )
-        # Allow an in-place upgrade from the first prototype schema.
-        existing_columns = {
-            row[1] for row in self._connection.execute("PRAGMA table_info(executor_idempotency)").fetchall()
-        }
-        for column, declaration in (
-            ("owner_id", "TEXT"),
-            ("lease_expires_at", "TEXT"),
-            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
-            ("created_at", "TEXT"),
-            ("updated_at", "TEXT"),
-        ):
-            if column not in existing_columns:
-                self._connection.execute(f"ALTER TABLE executor_idempotency ADD COLUMN {column} {declaration}")
 
-    def reserve(self, key: tuple[str, str, str]) -> tuple[str, ExecutionObservation | None]:
+    def reserve(self, key: tuple[str, str, str, str]) -> tuple[str, ExecutionObservation | None]:
         now = datetime.now(UTC)
         owner_id = f"pid-{threading.get_ident()}-{now.timestamp()}"
         lease_expires_at = (now + self._lease_duration).isoformat()
@@ -125,25 +119,28 @@ class SQLiteIdempotencyStore:
         try:
             row = self._connection.execute(
                 """
-                SELECT state, observation_json, lease_expires_at
-                FROM executor_idempotency
+                SELECT state, observation_json, lease_expires_at, intent_digest
+                FROM executor_idempotency_v3
                 WHERE executor_id = ? AND contract_digest = ? AND idempotency_key = ?
                 """,
-                key,
+                key[:3],
             ).fetchone()
             if row is None:
                 self._connection.execute(
                     """
-                    INSERT INTO executor_idempotency
-                    (executor_id, contract_digest, idempotency_key, state, observation_json,
+                    INSERT INTO executor_idempotency_v3
+                    (executor_id, contract_digest, idempotency_key, intent_digest, state, observation_json,
                      owner_id, lease_expires_at, attempts, created_at, updated_at)
-                    VALUES (?, ?, ?, 'pending', NULL, ?, ?, 1, ?, ?)
+                    VALUES (?, ?, ?, ?, 'pending', NULL, ?, ?, 1, ?, ?)
                     """,
                     (*key, owner_id, lease_expires_at, now.isoformat(), now.isoformat()),
                 )
                 self._connection.execute("COMMIT")
                 return "reserved", None
-            state, encoded, lease = row
+            state, encoded, lease, stored_intent_digest = row
+            if stored_intent_digest != key[3]:
+                self._connection.execute("COMMIT")
+                return "conflict", None
             if state == "completed":
                 self._connection.execute("COMMIT")
                 return "completed", self._decode_observation(encoded)
@@ -157,9 +154,9 @@ class SQLiteIdempotencyStore:
                 observation = self._indeterminate_observation("prior executor lease expired; side effect outcome is unknown")
                 self._connection.execute(
                     """
-                    UPDATE executor_idempotency
+                    UPDATE executor_idempotency_v3
                     SET state = 'indeterminate', observation_json = ?, updated_at = ?
-                    WHERE executor_id = ? AND contract_digest = ? AND idempotency_key = ?
+                    WHERE executor_id = ? AND contract_digest = ? AND idempotency_key = ? AND intent_digest = ?
                     """,
                     (self._encode_observation(observation), now.isoformat(), *key),
                 )
@@ -171,15 +168,15 @@ class SQLiteIdempotencyStore:
             self._connection.execute("ROLLBACK")
             raise
 
-    def complete(self, key: tuple[str, str, str], observation: ExecutionObservation) -> None:
+    def complete(self, key: tuple[str, str, str, str], observation: ExecutionObservation) -> None:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             cursor = self._connection.execute(
                 """
-                UPDATE executor_idempotency
+                UPDATE executor_idempotency_v3
                 SET state = 'completed', observation_json = ?, owner_id = NULL,
                     lease_expires_at = NULL, updated_at = ?
-                WHERE executor_id = ? AND contract_digest = ? AND idempotency_key = ? AND state = 'pending'
+                WHERE executor_id = ? AND contract_digest = ? AND idempotency_key = ? AND intent_digest = ? AND state = 'pending'
                 """,
                 (self._encode_observation(observation), datetime.now(UTC).isoformat(), *key),
             )
@@ -190,15 +187,15 @@ class SQLiteIdempotencyStore:
             self._connection.execute("ROLLBACK")
             raise
 
-    def mark_indeterminate(self, key: tuple[str, str, str], observation: ExecutionObservation) -> None:
+    def mark_indeterminate(self, key: tuple[str, str, str, str], observation: ExecutionObservation) -> None:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             cursor = self._connection.execute(
                 """
-                UPDATE executor_idempotency
+                UPDATE executor_idempotency_v3
                 SET state = 'indeterminate', observation_json = ?, owner_id = NULL,
                     lease_expires_at = NULL, updated_at = ?
-                WHERE executor_id = ? AND contract_digest = ? AND idempotency_key = ? AND state = 'pending'
+                WHERE executor_id = ? AND contract_digest = ? AND idempotency_key = ? AND intent_digest = ? AND state = 'pending'
                 """,
                 (self._encode_observation(observation), datetime.now(UTC).isoformat(), *key),
             )
@@ -286,7 +283,12 @@ class CapabilityEnforcingExecutor:
             self._capability_verifier.validate(capability, intent, executor_id=self.executor_id)
         except CapabilityRejected as exc:
             return self._authorization_failure(str(exc))
-        key = (self.executor_id, capability.contract_digest, intent.idempotency_key)
+        key = (
+            self.executor_id,
+            capability.contract_digest,
+            intent.idempotency_key,
+            intent.intent_digest,
+        )
         state, cached = self._idempotency_store.reserve(key)
         if state == "completed" and cached is not None:
             return replace(
@@ -295,6 +297,8 @@ class CapabilityEnforcingExecutor:
             )
         if state == "pending":
             return self._authorization_failure("idempotency key is already executing")
+        if state == "conflict":
+            return self._authorization_failure("idempotency key was already bound to a different intent")
         if state == "indeterminate":
             return replace(
                 cached or SQLiteIdempotencyStore._indeterminate_observation(
