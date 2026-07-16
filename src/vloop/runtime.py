@@ -13,17 +13,18 @@ from .authorization import SQLiteNonceStore
 from .completion import FinalVerifier
 from .evaluation import ProtectedEvaluationOrchestrator
 from .executor import CapabilityEnforcingExecutor, SQLiteIdempotencyStore
-from .firecracker import FirecrackerExecutor
+from .firecracker import FirecrackerEffectReconciler, FirecrackerExecutor
 from .models import TaskContract
 from .policy import PolicyGate, SQLiteApprovalConsumptionStore, SQLitePolicyUseCounterStore
 from .probes import ProtectedProbeRunner
 from .run_state import SQLiteRunStateStore
-from .services import FirecrackerSupervisorHTTPClient, LedgerAnchorHTTPClient
+from .services import FirecrackerSupervisorHTTPClient, LedgerAnchorHTTPClient, ProtectedEvaluatorHTTPClient
 from .verifiers import (
     DevelopmentBenchmarkVerifier,
     DevelopmentDifferentialVerifier,
     DevelopmentIsolationVerifier,
     DevelopmentMetamorphicVerifier,
+    ExecutionVerifier,
     HybridVerifier,
     SignedReceiptVerifier,
     StructuralVerifier,
@@ -58,6 +59,7 @@ class ProductionRuntime:
     state_store: SQLiteRunStateStore
     ledger_anchor: LedgerAnchorHTTPClient
     evaluation_orchestrator: ProtectedEvaluationOrchestrator
+    effect_reconciler: FirecrackerEffectReconciler
 
     def validate(self) -> None:
         """Revalidate mutable component internals immediately before startup."""
@@ -72,6 +74,7 @@ class ProductionRuntime:
             state_store=self.state_store,
             ledger_anchor=self.ledger_anchor,
             evaluation_orchestrator=self.evaluation_orchestrator,
+            effect_reconciler=self.effect_reconciler,
         ).validate()
 
     def create_loop(self, *, planner, ledger, **kwargs):
@@ -80,6 +83,24 @@ class ProductionRuntime:
         from .controller import VerifiedLoop
 
         self.validate()
+
+        protected_dependencies = {
+            "contract",
+            "gate",
+            "executor",
+            "verifier",
+            "final_verifier",
+            "probe_runner",
+            "state_store",
+            "evaluation_orchestrator",
+            "effect_reconciler",
+        }
+        overridden = protected_dependencies.intersection(kwargs)
+        if overridden:
+            raise ProductionConfigurationError(
+                "production loop dependencies are fixed by the validated runtime: "
+                + ", ".join(sorted(overridden))
+            )
 
         memory_committer = kwargs.get("memory_committer")
         memory_candidate_producer = kwargs.get("memory_candidate_producer")
@@ -104,6 +125,7 @@ class ProductionRuntime:
             probe_runner=self.probe_runner,
             state_store=self.state_store,
             evaluation_orchestrator=self.evaluation_orchestrator,
+            effect_reconciler=self.effect_reconciler,
             **kwargs,
         )
 
@@ -128,6 +150,7 @@ class ProductionRuntimeBuilder:
     state_store: SQLiteRunStateStore | None = None
     ledger_anchor: LedgerAnchorHTTPClient | None = None
     evaluation_orchestrator: ProtectedEvaluationOrchestrator | None = None
+    effect_reconciler: FirecrackerEffectReconciler | None = None
 
     def validate(self) -> None:
         failures: list[str] = []
@@ -182,12 +205,21 @@ class ProductionRuntimeBuilder:
             failures.append("a non-empty protected probe policy is required")
         elif self.probe_runner.policy_digest != self.contract.probe_policy_digest:
             failures.append("protected probe policy does not match the task-profile digest")
+        elif not self.probe_runner.production_ready:
+            failures.append("production probes need immutable image, suite, and resource identities")
         if not isinstance(self.state_store, SQLiteRunStateStore):
             failures.append("a durable SQLite controller run-state store is required")
         if not isinstance(self.ledger_anchor, LedgerAnchorHTTPClient):
             failures.append("an authenticated external ledger-anchor client is required")
         if not isinstance(self.evaluation_orchestrator, ProtectedEvaluationOrchestrator):
             failures.append("a protected evaluator orchestrator is required")
+        if not isinstance(self.effect_reconciler, FirecrackerEffectReconciler):
+            failures.append("a signed Firecracker effect reconciler is required")
+        elif not isinstance(self.executor, CapabilityEnforcingExecutor) or (
+            self.effect_reconciler.executor is not self.executor.raw_executor
+            or self.effect_reconciler.executor_id != self.executor.executor_id
+        ):
+            failures.append("effect reconciler is not bound to the configured Firecracker executor")
 
         required = self.contract.required_verifiers
         if any(rule.allow_unlisted_arguments for rule in self.contract.allowed_actions):
@@ -206,6 +238,8 @@ class ProductionRuntimeBuilder:
             failures.append("production contracts need immutable task-profile metadata")
         if not self.contract.action_safety_checks:
             failures.append("production contracts need mandatory action-safety checks")
+        elif "execution" not in self.contract.action_safety_checks:
+            failures.append("production action-safety checks must require execution success")
         if not self.contract.global_completion_guards:
             failures.append("production contracts need global completion guards")
         elif not set(self.contract.action_safety_checks).issubset(self.contract.global_completion_guards):
@@ -231,7 +265,13 @@ class ProductionRuntimeBuilder:
         # its protocol name explicit rather than relying on an implementation
         # attribute that it does not need at execution time.
         registered = {
-            ("structural" if isinstance(check, StructuralVerifier) else getattr(check, "name", "")): check
+            (
+                "structural"
+                if isinstance(check, StructuralVerifier)
+                else "execution"
+                if isinstance(check, ExecutionVerifier)
+                else getattr(check, "name", "")
+            ): check
             for check in checks
         }
         for category, names in required.items():
@@ -246,14 +286,27 @@ class ProductionRuntimeBuilder:
                 elif not check.receipt_verifier.policy.workspace_exclusion_policy_digests:
                     failures.append(f"required verifier {name!r} lacks an approved snapshot exclusion policy")
         if isinstance(self.evaluation_orchestrator, ProtectedEvaluationOrchestrator):
-            required_evaluator_checks = {
+            plans = {plan.check_name: plan for plan in self.evaluation_orchestrator.plans}
+            for name in (
                 name
                 for names in required.values()
                 for name in names
                 if isinstance(registered.get(name), SignedReceiptVerifier)
-            }
-            if not required_evaluator_checks.issubset(self.evaluation_orchestrator.check_names):
-                failures.append("protected evaluator orchestration does not cover every required receipt check")
+            ):
+                verifier = registered[name]
+                assert isinstance(verifier, SignedReceiptVerifier)  # narrowed by comprehension
+                plan = plans.get(name)
+                policy = verifier.receipt_verifier.policy
+                if plan is None:
+                    failures.append(f"protected evaluator orchestration does not cover required receipt check {name!r}")
+                elif not isinstance(plan.client, ProtectedEvaluatorHTTPClient):
+                    failures.append(f"required evaluator plan {name!r} needs the protected evaluator service client")
+                elif policy is None or (
+                    plan.receipt_type != verifier.receipt_type
+                    or plan.evaluator_image_digest not in policy.allowed_evaluator_images
+                    or plan.test_suite_digest not in policy.allowed_test_suites
+                ):
+                    failures.append(f"required evaluator plan {name!r} does not match its receipt verifier policy")
 
         bound_checks = {
             name for names in self.contract.success_condition_bindings.values() for name in names
@@ -301,6 +354,7 @@ class ProductionRuntimeBuilder:
         assert self.state_store is not None
         assert self.ledger_anchor is not None
         assert self.evaluation_orchestrator is not None
+        assert self.effect_reconciler is not None
         return ProductionRuntime(
             contract=self.contract,
             executor=self.executor,
@@ -311,4 +365,5 @@ class ProductionRuntimeBuilder:
             state_store=self.state_store,
             ledger_anchor=self.ledger_anchor,
             evaluation_orchestrator=self.evaluation_orchestrator,
+            effect_reconciler=self.effect_reconciler,
         )

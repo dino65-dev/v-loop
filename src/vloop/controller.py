@@ -22,6 +22,7 @@ from .models import (
     CheckStatus,
     ExecutionObservation,
     LoopDecision,
+    PreparedExecution,
     Provenance,
     TaskContract,
     VerificationReport,
@@ -64,6 +65,7 @@ class EffectReconciler(Protocol):
         contract: TaskContract,
         intent: ActionIntent,
         executor_id: str,
+        prepared_execution: PreparedExecution,
     ) -> ExecutionObservation: ...
 
 
@@ -126,7 +128,8 @@ class VerifiedLoop:
             if reconciled:
                 intent = self._checkpoint.pending_intent
                 observation = self._checkpoint.reconciled_observation
-                assert intent is not None and observation is not None  # checkpoint invariant
+                prepared_execution = self._checkpoint.prepared_execution
+                assert intent is not None and observation is not None and prepared_execution is not None  # checkpoint invariant
                 execution_event_hash = self.ledger.append(
                     "execution.reconciled",
                     {
@@ -134,6 +137,8 @@ class VerifiedLoop:
                         "iteration": iteration,
                         "intent_digest": intent.intent_digest,
                         "executor_id": self._checkpoint.executor_id,
+                        "operation_id": prepared_execution.operation_id,
+                        "request_digest": prepared_execution.request_digest,
                         "success": observation.success,
                         "exit_code": observation.exit_code,
                         "artifact_digests": dict(observation.artifact_digests),
@@ -186,15 +191,28 @@ class VerifiedLoop:
                 # Persist before the effect starts. A process death after this
                 # transition is never retried by the controller; the executor's
                 # idempotency/supervisor record must be reconciled first.
-                self._checkpoint_pending_effect(iteration, intent)
+                prepared_execution = self._prepare_execution(iteration, intent)
+                self._checkpoint_pending_effect(iteration, intent, prepared_execution)
                 self.ledger.append(
                     "execution.started",
-                    {"run_id": self.run_id, "iteration": iteration, "intent_digest": intent.intent_digest},
+                    {
+                        "run_id": self.run_id,
+                        "iteration": iteration,
+                        "intent_digest": intent.intent_digest,
+                        "operation_id": prepared_execution.operation_id,
+                        "remote_job_id": prepared_execution.remote_job_id,
+                        "request_digest": prepared_execution.request_digest,
+                    },
                 )
                 binder = getattr(self.executor, "bind_run", None)
                 if callable(binder):
                     binder(self.run_id, self.contract.contract_digest)
-                observation = self.executor.execute(intent, capability)
+                execute_prepared = getattr(self.executor, "execute_prepared", None)
+                observation = (
+                    execute_prepared(intent, capability, prepared_execution)
+                    if callable(execute_prepared)
+                    else self.executor.execute(intent, capability)
+                )
                 execution_event_hash = self.ledger.append(
                     "execution.observed",
                     {
@@ -202,6 +220,8 @@ class VerifiedLoop:
                         "intent_digest": intent.intent_digest,
                         "capability_id": capability.capability_id,
                         "executor_id": capability.executor_id,
+                        "operation_id": prepared_execution.operation_id,
+                        "request_digest": prepared_execution.request_digest,
                         "success": observation.success,
                         "exit_code": observation.exit_code,
                         "artifact_digests": dict(observation.artifact_digests),
@@ -275,7 +295,8 @@ class VerifiedLoop:
             # completion, not just reports that already satisfy every task
             # criterion. This closes the multi-step acceptance bypass.
             if (
-                (report.accepted or self._safe_for_criterion_progress(observation, report))
+                observation.success
+                and (report.accepted or self._safe_for_criterion_progress(observation, report))
                 and self.probe_runner is not None
             ):
                 preaccept_probes = self._run_probes(
@@ -287,7 +308,12 @@ class VerifiedLoop:
                 )
                 if preaccept_probes is not None:
                     report = self._merge_probe_report(report, preaccept_probes)
-            self._evidence.append(intent=intent, observation=observation, report=report)
+            # Preserve the diagnostic report in the ledger, but never let a
+            # failed side effect enter the completion evidence set.  Otherwise
+            # a later final verifier could mistake its passing checks for
+            # criterion evidence from a successful action.
+            if observation.success:
+                self._evidence.append(intent=intent, observation=observation, report=report)
             verification_event_hash = self.ledger.append(
                 "verification.completed",
                 {
@@ -337,7 +363,10 @@ class VerifiedLoop:
                 )
                 self._checkpoint_ready(iteration + 1)
                 continue
-            if report.accepted:
+            # A verifier report is evidence about an execution, never a
+            # substitute for that execution actually succeeding.  This also
+            # protects against an incorrectly implemented custom verifier.
+            if report.accepted and observation.success:
                 final_check, final_event_hash = self._verify_final_goal(report)
                 if final_check.status is CheckStatus.PASS:
                     self._commit_verified_memory(
@@ -462,6 +491,7 @@ class VerifiedLoop:
                 next_iteration=checkpoint.next_iteration,
                 pending_intent=checkpoint.pending_intent,
                 executor_id=checkpoint.executor_id,
+                prepared_execution=checkpoint.prepared_execution,
             )
             self.ledger.append(
                 "run.resume.blocked",
@@ -499,6 +529,7 @@ class VerifiedLoop:
         next_iteration: int,
         pending_intent: ActionIntent | None = None,
         executor_id: str = "",
+        prepared_execution: PreparedExecution | None = None,
         reconciled_observation: ExecutionObservation | None = None,
         terminal_decision: LoopDecision | None = None,
         terminal_reason: str | None = None,
@@ -518,6 +549,7 @@ class VerifiedLoop:
             evidence=self._evidence.snapshot(),
             pending_intent=pending_intent,
             executor_id=executor_id,
+            prepared_execution=prepared_execution,
             reconciled_observation=reconciled_observation,
             terminal_decision=terminal_decision.value if terminal_decision is not None else None,
             terminal_reason=terminal_reason,
@@ -533,12 +565,65 @@ class VerifiedLoop:
             executor_id=self.executor.executor_id,
         )
 
-    def _checkpoint_pending_effect(self, iteration: int, intent: ActionIntent) -> None:
+    def _prepare_execution(self, iteration: int, intent: ActionIntent) -> PreparedExecution:
+        """Mint the operation identity before durable effect dispatch."""
+
+        operation_id = digest(
+            {
+                "run_id": self.run_id,
+                "iteration": iteration,
+                "intent_digest": intent.intent_digest,
+                "idempotency_key": intent.idempotency_key,
+                "executor_id": self.executor.executor_id,
+            }
+        )
+        prepare = getattr(self.executor, "prepare_execution", None)
+        if callable(prepare):
+            prepared = prepare(
+                intent,
+                run_id=self.run_id,
+                contract_digest=self.contract.contract_digest,
+                iteration=iteration,
+                operation_id=operation_id,
+            )
+            if not isinstance(prepared, PreparedExecution):
+                raise TypeError("executor returned an invalid prepared execution")
+        else:
+            prepared = PreparedExecution(
+                operation_id=operation_id,
+                executor_id=self.executor.executor_id,
+                intent_digest=intent.intent_digest,
+                request_digest=digest(
+                    {
+                        "operation_id": operation_id,
+                        "run_id": self.run_id,
+                        "contract_digest": self.contract.contract_digest,
+                        "iteration": iteration,
+                        "intent_digest": intent.intent_digest,
+                    }
+                ),
+                remote_job_id=operation_id,
+            )
+        if (
+            prepared.operation_id != operation_id
+            or prepared.executor_id != self.executor.executor_id
+            or prepared.intent_digest != intent.intent_digest
+        ):
+            raise ValueError("prepared execution does not bind this operation")
+        return prepared
+
+    def _checkpoint_pending_effect(
+        self,
+        iteration: int,
+        intent: ActionIntent,
+        prepared_execution: PreparedExecution,
+    ) -> None:
         self._save_checkpoint(
             phase=RunPhase.PENDING_EFFECT,
             next_iteration=iteration,
             pending_intent=intent,
             executor_id=self.executor.executor_id,
+            prepared_execution=prepared_execution,
         )
 
     def _checkpoint_ready(self, next_iteration: int) -> None:
@@ -584,19 +669,27 @@ class VerifiedLoop:
         if checkpoint is None or checkpoint.phase is not RunPhase.RECONCILIATION_REQUIRED:
             raise RuntimeError("run does not require effect reconciliation")
         intent = checkpoint.pending_intent
-        assert intent is not None  # checkpoint invariant
+        prepared_execution = checkpoint.prepared_execution
+        assert intent is not None and prepared_execution is not None  # checkpoint invariant
         observation = self.effect_reconciler.reconcile(
             run_id=self.run_id,
             contract=self.contract,
             intent=intent,
             executor_id=checkpoint.executor_id,
+            prepared_execution=prepared_execution,
         )
+        if (
+            observation.metadata.get("operation_id") != prepared_execution.operation_id
+            or observation.metadata.get("request_digest") != prepared_execution.request_digest
+        ):
+            raise PermissionError("reconciliation observation is not bound to the prepared operation")
         self._checkpoint = checkpoint
         self._save_checkpoint(
             phase=RunPhase.RECONCILED_EFFECT,
             next_iteration=checkpoint.next_iteration,
             pending_intent=intent,
             executor_id=checkpoint.executor_id,
+            prepared_execution=prepared_execution,
             reconciled_observation=observation,
         )
         self.ledger.append(
@@ -605,6 +698,8 @@ class VerifiedLoop:
                 "run_id": self.run_id,
                 "intent_digest": intent.intent_digest,
                 "executor_id": checkpoint.executor_id,
+                "operation_id": prepared_execution.operation_id,
+                "request_digest": prepared_execution.request_digest,
                 "success": observation.success,
                 "exit_code": observation.exit_code,
             },
@@ -629,6 +724,8 @@ class VerifiedLoop:
     ) -> bool:
         """Separate mandatory action safety from incomplete task criteria."""
 
+        if not observation.success:
+            return False
         # Older development contracts did not contain a reviewed safety set.
         # Production contracts do, and only an all-PASS ActionSafetyReport may
         # contribute evidence there.

@@ -26,6 +26,7 @@ from .models import (
     CheckStatus,
     Effect,
     ExecutionObservation,
+    PreparedExecution,
     Provenance,
     VerificationReport,
 )
@@ -57,6 +58,7 @@ class RunCheckpoint:
     evidence: EvidenceSnapshot
     pending_intent: ActionIntent | None = None
     executor_id: str = ""
+    prepared_execution: PreparedExecution | None = None
     reconciled_observation: ExecutionObservation | None = None
     terminal_decision: str | None = None
     terminal_reason: str | None = None
@@ -82,7 +84,20 @@ class RunCheckpoint:
                 raise ValueError("pending run checkpoints need their exact intent")
             if not self.executor_id.strip():
                 raise ValueError("pending run checkpoints need their intended executor")
-        elif self.pending_intent is not None or self.executor_id:
+        if self.phase in {
+            RunPhase.PENDING_EFFECT,
+            RunPhase.RECONCILIATION_REQUIRED,
+            RunPhase.RECONCILED_EFFECT,
+        }:
+            if self.prepared_execution is None:
+                raise ValueError("effect checkpoints need a prepared operation")
+            if self.prepared_execution.executor_id != self.executor_id:
+                raise ValueError("prepared execution belongs to another executor")
+            if self.pending_intent is not None and self.prepared_execution.intent_digest != self.pending_intent.intent_digest:
+                raise ValueError("prepared execution belongs to another intent")
+        elif self.prepared_execution is not None:
+            raise ValueError("only effect checkpoints may retain a prepared operation")
+        if self.phase not in pending_phases and (self.pending_intent is not None or self.executor_id):
             raise ValueError("only a pending checkpoint may retain an intent")
         if self.phase is RunPhase.RECONCILED_EFFECT and self.reconciled_observation is None:
             raise ValueError("reconciled effects need an attested observation")
@@ -123,6 +138,7 @@ class SQLiteRunStateStore:
                 evidence_json TEXT NOT NULL,
                 pending_intent_json TEXT,
                 executor_id TEXT,
+                prepared_execution_json TEXT,
                 reconciled_observation_json TEXT,
                 terminal_decision TEXT,
                 terminal_reason TEXT,
@@ -134,6 +150,7 @@ class SQLiteRunStateStore:
         existing = {row[1] for row in self._connection.execute("PRAGMA table_info(run_checkpoints)").fetchall()}
         for column, declaration in (
             ("executor_id", "TEXT"),
+            ("prepared_execution_json", "TEXT"),
             ("reconciled_observation_json", "TEXT"),
         ):
             if column not in existing:
@@ -144,6 +161,7 @@ class SQLiteRunStateStore:
             """
             SELECT contract_digest, phase, next_iteration, tool_calls, history_json,
                    seen_failures_json, evidence_json, pending_intent_json, executor_id,
+                   prepared_execution_json,
                    reconciled_observation_json,
                    terminal_decision, terminal_reason, revision, updated_at
             FROM run_checkpoints WHERE run_id = ?
@@ -163,11 +181,12 @@ class SQLiteRunStateStore:
             evidence=_decode_evidence(run_id, json.loads(row[6])),
             pending_intent=_decode_intent(json.loads(row[7])) if row[7] else None,
             executor_id=row[8] or "",
-            reconciled_observation=_decode_observation(json.loads(row[9])) if row[9] else None,
-            terminal_decision=row[10],
-            terminal_reason=row[11],
-            revision=int(row[12]),
-            updated_at=datetime.fromisoformat(row[13]),
+            prepared_execution=_decode_prepared_execution(json.loads(row[9])) if row[9] else None,
+            reconciled_observation=_decode_observation(json.loads(row[10])) if row[10] else None,
+            terminal_decision=row[11],
+            terminal_reason=row[12],
+            revision=int(row[13]),
+            updated_at=datetime.fromisoformat(row[14]),
         )
 
     def save(self, checkpoint: RunCheckpoint) -> RunCheckpoint:
@@ -181,6 +200,9 @@ class SQLiteRunStateStore:
             canonical_json(_encode_evidence(checkpoint.evidence)),
             canonical_json(_encode_intent(checkpoint.pending_intent)) if checkpoint.pending_intent else None,
             checkpoint.executor_id or None,
+            canonical_json(_encode_prepared_execution(checkpoint.prepared_execution))
+            if checkpoint.prepared_execution
+            else None,
             canonical_json(_encode_observation(checkpoint.reconciled_observation))
             if checkpoint.reconciled_observation
             else None,
@@ -202,9 +224,9 @@ class SQLiteRunStateStore:
                     INSERT INTO run_checkpoints (
                         run_id, contract_digest, phase, next_iteration, tool_calls,
                         history_json, seen_failures_json, evidence_json, pending_intent_json,
-                        executor_id, reconciled_observation_json, terminal_decision, terminal_reason,
+                        executor_id, prepared_execution_json, reconciled_observation_json, terminal_decision, terminal_reason,
                         revision, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (checkpoint.run_id, *encoded, revision, now.isoformat()),
                 )
@@ -217,7 +239,7 @@ class SQLiteRunStateStore:
                     UPDATE run_checkpoints
                     SET contract_digest = ?, phase = ?, next_iteration = ?, tool_calls = ?,
                         history_json = ?, seen_failures_json = ?, evidence_json = ?,
-                        pending_intent_json = ?, executor_id = ?, reconciled_observation_json = ?,
+                        pending_intent_json = ?, executor_id = ?, prepared_execution_json = ?, reconciled_observation_json = ?,
                         terminal_decision = ?, terminal_reason = ?,
                         revision = ?, updated_at = ?
                     WHERE run_id = ? AND revision = ?
@@ -241,6 +263,7 @@ class SQLiteRunStateStore:
             evidence=checkpoint.evidence,
             pending_intent=checkpoint.pending_intent,
             executor_id=checkpoint.executor_id,
+            prepared_execution=checkpoint.prepared_execution,
             reconciled_observation=checkpoint.reconciled_observation,
             terminal_decision=checkpoint.terminal_decision,
             terminal_reason=checkpoint.terminal_reason,
@@ -371,6 +394,26 @@ def _decode_observation(value: Mapping[str, Any]) -> ExecutionObservation:
         stderr=str(value["stderr"]),
         artifact_digests=dict(value["artifact_digests"]),
         metadata=dict(value["metadata"]),
+    )
+
+
+def _encode_prepared_execution(prepared: PreparedExecution) -> dict[str, str]:
+    return {
+        "operation_id": prepared.operation_id,
+        "executor_id": prepared.executor_id,
+        "intent_digest": prepared.intent_digest,
+        "request_digest": prepared.request_digest,
+        "remote_job_id": prepared.remote_job_id,
+    }
+
+
+def _decode_prepared_execution(value: Mapping[str, Any]) -> PreparedExecution:
+    return PreparedExecution(
+        operation_id=str(value["operation_id"]),
+        executor_id=str(value["executor_id"]),
+        intent_digest=str(value["intent_digest"]),
+        request_digest=str(value["request_digest"]),
+        remote_job_id=str(value["remote_job_id"]),
     )
 
 

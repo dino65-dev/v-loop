@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from .canonical import digest
+from .probes import ProbeDefinition, probe_policy_digest
 from .models import ActionRule, ArgumentRule, Effect, TaskContract
 
 
@@ -52,6 +53,7 @@ class TaskProfile:
     action_safety_checks: tuple[str, ...] = ("structural",)
     global_completion_guards: tuple[str, ...] = ("structural",)
     profile_version: str = "1"
+    probe_manifest: tuple[ProbeDefinition, ...] = ()
 
     def __post_init__(self) -> None:
         if not all((self.task_kind, self.probe_policy_id, self.risk_class)):
@@ -73,7 +75,7 @@ class TaskProfile:
 
     @property
     def probe_policy_digest(self) -> str:
-        return digest({"probe_policy_id": self.probe_policy_id})
+        return probe_policy_digest(self.probe_policy_id, self.probe_manifest)
 
     @property
     def profile_digest(self) -> str:

@@ -20,7 +20,7 @@ from typing import Protocol, Sequence
 
 from .authorization import CapabilityRejected, CapabilityVerifier
 from .canonical import digest
-from .models import ActionIntent, Capability, ExecutionObservation
+from .models import ActionIntent, Capability, ExecutionObservation, PreparedExecution
 
 
 class Executor(Protocol):
@@ -278,7 +278,73 @@ class CapabilityEnforcingExecutor:
     def capability_verifier(self) -> CapabilityVerifier:
         return self._capability_verifier
 
+    def prepare_execution(
+        self,
+        intent: ActionIntent,
+        *,
+        run_id: str,
+        contract_digest: str,
+        iteration: int,
+        operation_id: str,
+    ) -> PreparedExecution:
+        """Prepare a durable operation identity without starting its effect."""
+
+        prepare = getattr(self._raw_executor, "prepare_execution", None)
+        if callable(prepare):
+            prepared = prepare(
+                intent,
+                run_id=run_id,
+                contract_digest=contract_digest,
+                iteration=iteration,
+                operation_id=operation_id,
+                executor_id=self.executor_id,
+            )
+            if not isinstance(prepared, PreparedExecution):
+                raise TypeError("raw executor returned an invalid prepared execution")
+            if (
+                prepared.operation_id != operation_id
+                or prepared.executor_id != self.executor_id
+                or prepared.intent_digest != intent.intent_digest
+            ):
+                raise ValueError("raw executor prepared another operation")
+            return prepared
+        return PreparedExecution(
+            operation_id=operation_id,
+            executor_id=self.executor_id,
+            intent_digest=intent.intent_digest,
+            request_digest=digest(
+                {
+                    "operation_id": operation_id,
+                    "run_id": run_id,
+                    "contract_digest": contract_digest,
+                    "iteration": iteration,
+                    "intent_digest": intent.intent_digest,
+                    "idempotency_key": intent.idempotency_key,
+                }
+            ),
+            remote_job_id=operation_id,
+        )
+
     def execute(self, intent: ActionIntent, capability: Capability) -> ExecutionObservation:
+        return self._execute(intent, capability, prepared=None)
+
+    def execute_prepared(
+        self,
+        intent: ActionIntent,
+        capability: Capability,
+        prepared: PreparedExecution,
+    ) -> ExecutionObservation:
+        if prepared.executor_id != self.executor_id or prepared.intent_digest != intent.intent_digest:
+            return self._authorization_failure("prepared execution is not bound to this executor and intent")
+        return self._execute(intent, capability, prepared=prepared)
+
+    def _execute(
+        self,
+        intent: ActionIntent,
+        capability: Capability,
+        *,
+        prepared: PreparedExecution | None,
+    ) -> ExecutionObservation:
         try:
             self._capability_verifier.validate(capability, intent, executor_id=self.executor_id)
         except CapabilityRejected as exc:
@@ -320,7 +386,12 @@ class CapabilityEnforcingExecutor:
             self._idempotency_store.complete(key, observation)
             return observation
         try:
-            observation = self._raw_executor.execute(intent)
+            execute_prepared = getattr(self._raw_executor, "execute_prepared", None)
+            observation = (
+                execute_prepared(intent, prepared)
+                if prepared is not None and callable(execute_prepared)
+                else self._raw_executor.execute(intent)
+            )
         except Exception as exc:
             observation = SQLiteIdempotencyStore._indeterminate_observation(
                 f"raw executor raised {type(exc).__name__}; side effect outcome is unknown"

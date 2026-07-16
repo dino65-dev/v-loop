@@ -23,6 +23,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from .canonical import canonical_json, digest
 from .firecracker import FirecrackerLaunch, GuestExecutionResult
+from .models import PreparedExecution
 from .ledger import LedgerAnchorRecord
 
 
@@ -145,22 +146,46 @@ class FirecrackerSupervisorHTTPClient:
     name: str = "firecracker-supervisor"
 
     def run(self, launch: FirecrackerLaunch) -> GuestExecutionResult:
-        if not launch.remote_asset_request:
-            raise RemoteServiceError("remote Firecracker jobs require opaque asset identities")
+        if not launch.remote_execution_spec or not launch.remote_execution_spec_digest:
+            raise RemoteServiceError("remote Firecracker jobs require a canonical execution specification")
         response = self.client.post(
             self.endpoint,
             {
-                "job_id": launch.job_id,
                 # The privileged service resolves its own allowlisted asset
                 # IDs and creates the writable job drive itself. Never send
                 # controller-visible kernel/rootfs/drive paths over the API.
-                "asset_request": dict(launch.remote_asset_request),
+                "execution_spec": dict(launch.remote_execution_spec),
+                "execution_spec_digest": launch.remote_execution_spec_digest,
                 "manifest": dict(launch.manifest),
-                "config_digest": launch.config_digest,
                 "manifest_digest": launch.manifest_digest,
             },
-            idempotency_key=launch.job_id,
+            idempotency_key=launch.remote_execution_spec["operation_id"],
         )
+        result = self._decode_result(response)
+        if result.manifest_digest != launch.manifest_digest:
+            raise RemoteServiceError("Firecracker supervisor response is bound to another manifest")
+        return result
+
+    def reconcile(self, prepared_execution: PreparedExecution) -> GuestExecutionResult:
+        """Query an existing operation; never submit or replay a new effect."""
+
+        response = self.client.post(
+            f"{self.endpoint}/{prepared_execution.operation_id}/reconcile",
+            {
+                "operation_id": prepared_execution.operation_id,
+                "execution_spec_digest": prepared_execution.request_digest,
+            },
+            idempotency_key=prepared_execution.operation_id,
+        )
+        if (
+            response.get("operation_id") != prepared_execution.operation_id
+            or response.get("execution_spec_digest") != prepared_execution.request_digest
+        ):
+            raise RemoteServiceError("Firecracker reconciliation response is bound to another operation")
+        return self._decode_result(response)
+
+    @staticmethod
+    def _decode_result(response: Mapping[str, Any]) -> GuestExecutionResult:
         try:
             artifacts = response.get("artifact_digests", {})
             receipt = response.get("supervisor_receipt")
@@ -181,7 +206,7 @@ class FirecrackerSupervisorHTTPClient:
                 exit_code is not None and (not isinstance(exit_code, int) or isinstance(exit_code, bool))
             ):
                 raise ValueError("invalid success or exit status")
-            result = GuestExecutionResult(
+            return GuestExecutionResult(
                 manifest_digest=str(response["manifest_digest"]),
                 success=success,
                 exit_code=exit_code,
@@ -195,9 +220,6 @@ class FirecrackerSupervisorHTTPClient:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise RemoteServiceError("Firecracker supervisor response violated its schema") from exc
-        if result.manifest_digest != launch.manifest_digest:
-            raise RemoteServiceError("Firecracker supervisor response is bound to another manifest")
-        return result
 
 
 @dataclass(frozen=True, slots=True)

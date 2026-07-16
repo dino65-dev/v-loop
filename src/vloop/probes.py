@@ -23,12 +23,26 @@ class ProbeKind(StrEnum):
     CONSISTENCY = "consistency"
 
 
+def probe_policy_digest(policy_id: str, definitions: Iterable["ProbeDefinition"]) -> str:
+    """Hash the complete reviewed probe manifest, not a mutable label alone."""
+
+    return digest(
+        {
+            "probe_policy_id": policy_id,
+            "probes": [definition.manifest for definition in sorted(definitions, key=lambda item: item.probe_id)],
+        }
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ProbeDefinition:
     probe_id: str
     kind: ProbeKind
     description: str
     trigger_categories: tuple[str, ...] = ("evidence",)
+    implementation_image_digest: str = ""
+    test_suite_digest: str = ""
+    resource_profile_digest: str = ""
 
     def __post_init__(self) -> None:
         if not self.probe_id.strip() or not self.description.strip():
@@ -38,6 +52,30 @@ class ProbeDefinition:
             for category in self.trigger_categories
         ):
             raise ValueError("probe has an invalid trigger category")
+
+    @property
+    def manifest(self) -> dict[str, object]:
+        return {
+            "probe_id": self.probe_id,
+            "kind": self.kind.value,
+            "trigger_categories": tuple(sorted(self.trigger_categories)),
+            "implementation_image_digest": self.implementation_image_digest,
+            "test_suite_digest": self.test_suite_digest,
+            "resource_profile_digest": self.resource_profile_digest,
+        }
+
+    @property
+    def production_ready(self) -> bool:
+        return all(
+            value.strip()
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+            for value in (
+                self.implementation_image_digest,
+                self.test_suite_digest,
+                self.resource_profile_digest,
+            )
+        )
 
 
 class ProtectedProbe(Protocol):
@@ -106,7 +144,13 @@ class ProtectedProbeRunner:
 
     @property
     def policy_digest(self) -> str:
-        return digest({"probe_policy_id": self._policy_id}) if self._policy_id else ""
+        return probe_policy_digest(self._policy_id, self.definitions) if self._policy_id else ""
+
+    @property
+    def production_ready(self) -> bool:
+        return bool(self._policy_id) and bool(self._probes) and all(
+            probe.definition.production_ready for probe in self._probes
+        )
 
     def run(
         self,

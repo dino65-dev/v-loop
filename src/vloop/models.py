@@ -54,6 +54,29 @@ class LoopDecision(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedExecution:
+    """Controller-persisted identity for one potentially irreversible effect.
+
+    This record is created before the remote call.  It lets restart recovery
+    query and validate the exact operation instead of accepting an arbitrary
+    observation for a matching intent.
+    """
+
+    operation_id: str
+    executor_id: str
+    intent_digest: str
+    request_digest: str
+    remote_job_id: str
+
+    def __post_init__(self) -> None:
+        if not self.operation_id.strip() or not self.executor_id.strip() or not self.remote_job_id.strip():
+            raise ValueError("prepared execution needs operation, executor, and remote job identities")
+        for label, value in (("intent", self.intent_digest), ("request", self.request_digest)):
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError(f"prepared execution {label} digest must be SHA-256 hex")
+
+
+@dataclass(frozen=True, slots=True)
 class ArgumentRule:
     """Server-owned semantics for one named action argument."""
 

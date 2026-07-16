@@ -19,7 +19,7 @@ from typing import Any, Mapping, Protocol
 from uuid import uuid4
 
 from .canonical import digest
-from .models import ActionIntent, Effect, ExecutionObservation
+from .models import ActionIntent, Effect, ExecutionObservation, PreparedExecution
 from .receipts import EvaluationReceipt, ReceiptRejected, ReceiptVerifier
 
 
@@ -179,6 +179,7 @@ class FirecrackerAssets:
     rootfs_digest: str = ""
     resource_profile_id: str = ""
     workspace_snapshot_id: str = ""
+    workspace_snapshot_digest: str = ""
 
     def validate(self) -> None:
         for label, path in (
@@ -202,10 +203,11 @@ class FirecrackerAssets:
             "rootfs_digest": self.rootfs_digest,
             "resource_profile_id": self.resource_profile_id,
             "workspace_snapshot_id": self.workspace_snapshot_id,
+            "workspace_snapshot_digest": self.workspace_snapshot_digest,
         }
         if not all(value.strip() for value in values.values()):
             return {}
-        for digest_field in ("kernel_image_digest", "rootfs_digest"):
+        for digest_field in ("kernel_image_digest", "rootfs_digest", "workspace_snapshot_digest"):
             value = values[digest_field]
             if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
                 raise FirecrackerConfigurationError(f"{digest_field} must be a SHA-256 hex digest")
@@ -235,6 +237,8 @@ class FirecrackerLaunch:
     config_digest: str
     manifest_digest: str
     remote_asset_request: Mapping[str, str] = field(default_factory=dict)
+    remote_execution_spec: Mapping[str, str] = field(default_factory=dict)
+    remote_execution_spec_digest: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +271,7 @@ class FirecrackerJobBuilder:
         *,
         run_id: str = "unbound",
         contract_digest: str | None = None,
+        operation_id: str | None = None,
     ) -> FirecrackerLaunch:
         if intent.tool != "command.run" or intent.effect is not Effect.EXECUTE:
             raise FirecrackerConfigurationError("Firecracker only executes command.run intents")
@@ -282,10 +287,30 @@ class FirecrackerJobBuilder:
         if requested_timeout != self.resources.timeout_seconds:
             raise FirecrackerConfigurationError("timeout must match the supervisor-issued resource profile")
 
-        job_id = str(uuid4())
+        job_id = operation_id or str(uuid4())
+        remote_asset_request = self.assets.remote_asset_request
+        remote_execution_spec = (
+            {
+                "operation_id": job_id,
+                "kernel_image_id": remote_asset_request["kernel_image_id"],
+                "kernel_digest": remote_asset_request["kernel_image_digest"],
+                "rootfs_image_id": remote_asset_request["rootfs_image_id"],
+                "rootfs_digest": remote_asset_request["rootfs_digest"],
+                "resource_profile_id": remote_asset_request["resource_profile_id"],
+                "workspace_snapshot_id": remote_asset_request["workspace_snapshot_id"],
+                "workspace_snapshot_digest": remote_asset_request["workspace_snapshot_digest"],
+                "run_id": run_id,
+                "contract_digest": contract_digest or "unbound",
+                "intent_digest": intent.intent_digest,
+            }
+            if remote_asset_request
+            else {}
+        )
+        remote_execution_spec_digest = digest(remote_execution_spec) if remote_execution_spec else ""
         manifest = {
             "schema_version": 1,
             "job_id": job_id,
+            "operation_id": job_id,
             "run_id": run_id,
             "contract_digest": contract_digest or "unbound",
             "intent_digest": intent.intent_digest,
@@ -294,6 +319,7 @@ class FirecrackerJobBuilder:
             "timeout_seconds": self.resources.timeout_seconds,
             "network_enabled": False,
             "result_path": "/job/vloop-result.json",
+            "remote_execution_spec_digest": remote_execution_spec_digest,
         }
         config = {
             "boot-source": {
@@ -327,7 +353,9 @@ class FirecrackerJobBuilder:
             manifest=manifest,
             config_digest=digest(config),
             manifest_digest=digest(manifest),
-            remote_asset_request=self.assets.remote_asset_request,
+            remote_asset_request=remote_asset_request,
+            remote_execution_spec=remote_execution_spec,
+            remote_execution_spec_digest=remote_execution_spec_digest,
         )
 
 
@@ -345,6 +373,7 @@ class FirecrackerExecutor:
         self._supervisor_receipt_verifier = supervisor_receipt_verifier
         self._run_id: str | None = None
         self._contract_digest: str | None = None
+        self._prepared_launches: dict[str, FirecrackerLaunch] = {}
 
     @property
     def supervisor_receipt_verifier(self) -> ReceiptVerifier | None:
@@ -366,6 +395,34 @@ class FirecrackerExecutor:
         self._run_id = run_id
         self._contract_digest = contract_digest
 
+    def prepare_execution(
+        self,
+        intent: ActionIntent,
+        *,
+        run_id: str,
+        contract_digest: str,
+        iteration: int,
+        operation_id: str,
+        executor_id: str,
+    ) -> PreparedExecution:
+        del iteration
+        launch = self._builder.build(
+            intent,
+            run_id=run_id,
+            contract_digest=contract_digest,
+            operation_id=operation_id,
+        )
+        if not launch.remote_execution_spec_digest:
+            raise FirecrackerConfigurationError("remote Firecracker preparation requires a canonical execution spec")
+        self._prepared_launches[operation_id] = launch
+        return PreparedExecution(
+            operation_id=operation_id,
+            executor_id=executor_id,
+            intent_digest=intent.intent_digest,
+            request_digest=launch.remote_execution_spec_digest,
+            remote_job_id=launch.job_id,
+        )
+
     def execute(self, intent: ActionIntent) -> ExecutionObservation:
         try:
             launch = self._builder.build(
@@ -375,6 +432,39 @@ class FirecrackerExecutor:
             )
         except FirecrackerConfigurationError as exc:
             return ExecutionObservation(False, None, "", str(exc), metadata={"executor": "firecracker"})
+        return self._execute_launch(intent, launch, prepared_execution=None)
+
+    def execute_prepared(
+        self, intent: ActionIntent, prepared_execution: PreparedExecution
+    ) -> ExecutionObservation:
+        launch = self._prepared_launches.pop(prepared_execution.operation_id, None)
+        if launch is None:
+            return ExecutionObservation(
+                False,
+                None,
+                "",
+                "prepared Firecracker operation is unavailable; reconciliation is required",
+                metadata={
+                    "executor": "firecracker",
+                    "operation_id": prepared_execution.operation_id,
+                    "request_digest": prepared_execution.request_digest,
+                },
+            )
+        if (
+            launch.job_id != prepared_execution.remote_job_id
+            or launch.remote_execution_spec_digest != prepared_execution.request_digest
+            or intent.intent_digest != prepared_execution.intent_digest
+        ):
+            return ExecutionObservation(False, None, "", "prepared Firecracker operation binding mismatch")
+        return self._execute_launch(intent, launch, prepared_execution=prepared_execution)
+
+    def _execute_launch(
+        self,
+        intent: ActionIntent,
+        launch: FirecrackerLaunch,
+        *,
+        prepared_execution: PreparedExecution | None,
+    ) -> ExecutionObservation:
         result = self._supervisor.run(launch)
         if result.manifest_digest != launch.manifest_digest:
             return ExecutionObservation(
@@ -391,7 +481,9 @@ class FirecrackerExecutor:
             )
         receipt_metadata: dict[str, Any] = {}
         if self._supervisor_receipt_verifier is not None:
-            receipt_error = self._validate_supervisor_receipt(launch, intent, result)
+            receipt_error = self._validate_supervisor_receipt(
+                launch, intent, result, prepared_execution=prepared_execution
+            )
             if receipt_error is not None:
                 return ExecutionObservation(
                     False,
@@ -417,6 +509,15 @@ class FirecrackerExecutor:
                 "guest_result_path": result.result_path,
                 "rootfs_read_only": True,
                 "network_enabled": False,
+                **(
+                    {
+                        "operation_id": prepared_execution.operation_id,
+                        "request_digest": prepared_execution.request_digest,
+                        "remote_job_id": prepared_execution.remote_job_id,
+                    }
+                    if prepared_execution is not None
+                    else {}
+                ),
                 **receipt_metadata,
             },
         )
@@ -426,6 +527,8 @@ class FirecrackerExecutor:
         launch: FirecrackerLaunch,
         intent: ActionIntent,
         result: GuestExecutionResult,
+        *,
+        prepared_execution: PreparedExecution | None,
     ) -> str | None:
         if self._run_id is None or result.supervisor_receipt is None:
             return "missing supervisor-signed execution receipt"
@@ -449,6 +552,11 @@ class FirecrackerExecutor:
             or claims.get("job_drive_destroyed") is not True
         ):
             return "supervisor receipt lacks required job lifecycle attestations"
+        if prepared_execution is not None and (
+            claims.get("operation_id") != prepared_execution.operation_id
+            or claims.get("execution_spec_digest") != prepared_execution.request_digest
+        ):
+            return "supervisor receipt is not bound to the prepared operation"
         expected_result = "pass" if result.success and result.exit_code == 0 else "fail"
         if receipt.result != expected_result:
             return "supervisor receipt result disagrees with guest execution outcome"
@@ -471,3 +579,112 @@ class FirecrackerExecutor:
         if result.success and (claims["timed_out"] or claims["oom_killed"]):
             return "successful guest result conflicts with timeout/OOM attestation"
         return None
+
+    def reconcile_prepared(
+        self,
+        intent: ActionIntent,
+        prepared_execution: PreparedExecution,
+    ) -> ExecutionObservation:
+        """Recover only a previously prepared remote operation by signed receipt."""
+
+        reconcile = getattr(self._supervisor, "reconcile", None)
+        if not callable(reconcile):
+            raise FirecrackerConfigurationError("supervisor does not support signed operation reconciliation")
+        result = reconcile(prepared_execution)
+        if not isinstance(result, GuestExecutionResult):
+            raise FirecrackerConfigurationError("supervisor reconciliation returned an invalid result")
+        receipt_error = self._validate_reconciliation_receipt(intent, prepared_execution, result)
+        if receipt_error is not None:
+            raise PermissionError(receipt_error)
+        return ExecutionObservation(
+            success=result.success,
+            exit_code=result.exit_code,
+            stdout=result.stdout[-16_384:],
+            stderr=result.stderr[-16_384:],
+            artifact_digests=dict(result.artifact_digests),
+            metadata={
+                "executor": "firecracker",
+                "isolation": "microvm",
+                "operation_id": prepared_execution.operation_id,
+                "request_digest": prepared_execution.request_digest,
+                "remote_job_id": prepared_execution.remote_job_id,
+                "reconciliation_signed": True,
+                "evaluator_receipts": {"firecracker-supervisor": result.supervisor_receipt},
+            },
+        )
+
+    def _validate_reconciliation_receipt(
+        self,
+        intent: ActionIntent,
+        prepared_execution: PreparedExecution,
+        result: GuestExecutionResult,
+    ) -> str | None:
+        if self._run_id is None or result.supervisor_receipt is None or self._supervisor_receipt_verifier is None:
+            return "missing supervisor-signed reconciliation receipt"
+        try:
+            receipt = EvaluationReceipt.from_mapping(result.supervisor_receipt)
+            self._supervisor_receipt_verifier.validate(
+                receipt,
+                receipt_type="firecracker-supervisor",
+                run_id=self._run_id,
+                intent_digest=intent.intent_digest,
+                artifact_digests=result.artifact_digests,
+                contract_digest=self._contract_digest,
+            )
+        except (KeyError, TypeError, ValueError, ReceiptRejected):
+            return "supervisor-signed reconciliation receipt was rejected"
+        claims = receipt.claims
+        if (
+            claims.get("operation_id") != prepared_execution.operation_id
+            or claims.get("execution_spec_digest") != prepared_execution.request_digest
+            or claims.get("reconciliation") is not True
+            or claims.get("fresh_job_drive") is not True
+            or claims.get("job_drive_destroyed") is not True
+        ):
+            return "reconciliation receipt lacks prepared-operation lifecycle attestations"
+        expected_result = "pass" if result.success and result.exit_code == 0 else "fail"
+        if receipt.result != expected_result:
+            return "reconciliation receipt result disagrees with guest execution outcome"
+        expected_claims = {
+            "exit_code": result.exit_code,
+            "result_path": result.result_path,
+            "stdout_digest": digest(result.stdout),
+            "stderr_digest": digest(result.stderr),
+            "result_file_digest": result.result_file_digest,
+        }
+        if any(claims.get(name) != value for name, value in expected_claims.items()):
+            return "reconciliation receipt does not bind the exact guest result"
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class FirecrackerEffectReconciler:
+    """Production-only reconciler backed by the signed Firecracker supervisor."""
+
+    executor: FirecrackerExecutor
+    executor_id: str
+
+    def __post_init__(self) -> None:
+        if not self.executor_id.strip():
+            raise ValueError("Firecracker reconciler needs an executor identity")
+        if self.executor.supervisor_receipt_verifier is None:
+            raise ValueError("Firecracker reconciler needs a supervisor receipt verifier")
+        if not callable(getattr(self.executor.supervisor, "reconcile", None)):
+            raise ValueError("Firecracker reconciler needs a reconciliation-capable supervisor")
+
+    def reconcile(
+        self,
+        *,
+        run_id: str,
+        contract: object,
+        intent: ActionIntent,
+        executor_id: str,
+        prepared_execution: PreparedExecution,
+    ) -> ExecutionObservation:
+        if executor_id != self.executor_id or prepared_execution.executor_id != executor_id:
+            raise PermissionError("reconciliation request targets another executor")
+        contract_digest = getattr(contract, "contract_digest", None)
+        if not isinstance(contract_digest, str):
+            raise TypeError("reconciliation needs a task contract")
+        self.executor.bind_run(run_id, contract_digest)
+        return self.executor.reconcile_prepared(intent, prepared_execution)

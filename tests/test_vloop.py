@@ -33,6 +33,7 @@ from vloop.executor import BubblewrapExecutor
 from vloop.executor import CapabilityEnforcingExecutor, InMemoryIdempotencyStore, SQLiteIdempotencyStore
 from vloop.firecracker import (
     FirecrackerAssets,
+    FirecrackerEffectReconciler,
     FirecrackerExecutor,
     FirecrackerJobBuilder,
     FirecrackerPreflight,
@@ -95,7 +96,7 @@ from vloop.policy import (
     SQLitePolicyUseCounterStore,
     SQLiteApprovalConsumptionStore,
 )
-from vloop.probes import CallableProbe, ProbeDefinition, ProbeKind, ProtectedProbeRunner
+from vloop.probes import CallableProbe, ProbeDefinition, ProbeKind, ProtectedProbeRunner, probe_policy_digest
 from vloop.receipts import ReceiptKeyTrustEntry, ReceiptPolicy, ReceiptSigner, ReceiptVerifier
 from vloop.snapshot import CanonicalWorkspaceSnapshotter, SNAPSHOT_SCHEMA, WorkspaceSnapshot
 from vloop.repair import RepairController
@@ -267,6 +268,50 @@ def test_loop_accepts_only_after_independent_checks(tmp_path: Path) -> None:
     assert loop.run() is LoopDecision.ACCEPT
     assert ledger.verify_chain()
     assert ledger.events()[-1]["payload"]["reason"] == "verified-success"
+
+
+def test_failed_execution_cannot_advance_criteria_even_if_a_verifier_is_wrong(tmp_path: Path) -> None:
+    """Execution success is a controller precondition, not advisory evidence."""
+
+    task = replace(contract(), maximum_iterations=1)
+
+    class FailedExecutor(Executor):
+        def execute(self, action, capability):
+            del action, capability
+            return ExecutionObservation(False, 1, "", "command failed", {})
+
+    class IncorrectlyPassingVerifier:
+        def verify(self, *_args, **_kwargs):
+            return VerificationReport(
+                CheckStatus.PASS,
+                CheckStatus.PASS,
+                CheckStatus.PASS,
+                CheckStatus.PASS,
+                (CheckResult("execution", CheckStatus.PASS, {}),),
+            )
+
+    ledger = EvidenceLedger(tmp_path / "ledger.db")
+    state = SQLiteRunStateStore(tmp_path / "state.db")
+    loop = VerifiedLoop(
+        contract=task,
+        planner=Planner(task),
+        gate=PolicyGate(task, signing_key=b"z" * 32),
+        executor=FailedExecutor(),
+        verifier=IncorrectlyPassingVerifier(),
+        ledger=ledger,
+        final_verifier=final_verifier(),
+        state_store=state,
+        run_id="failed-execution-is-not-evidence",
+    )
+    assert loop.run() is not LoopDecision.ACCEPT
+    checkpoint = state.load("failed-execution-is-not-evidence")
+    assert checkpoint is not None and not checkpoint.evidence.actions
+    assert not [event for event in ledger.events() if event["event_type"] == "criterion.progressed"]
+    assert not [
+        event
+        for event in ledger.events()
+        if event["event_type"] == "run.terminal" and event["payload"]["reason"] == "verified-success"
+    ]
 
 
 def test_memory_gate_rejects_unverified_experience() -> None:
@@ -1222,6 +1267,7 @@ def test_firecracker_supervisor_preflight_fails_closed_and_plan_is_shell_free(tm
         rootfs_digest="b" * 64,
         resource_profile_id="isolated-small",
         workspace_snapshot_id="workspace-snapshot-2026",
+        workspace_snapshot_digest="c" * 64,
     )
     runtime = FirecrackerRuntime(firecracker, tmp_path / "missing-jailer", chroot, tmp_path / "missing-kvm")
     preflight = FirecrackerPreflight.check(runtime, assets)
@@ -1243,7 +1289,7 @@ def test_firecracker_supervisor_preflight_fails_closed_and_plan_is_shell_free(tm
 
         def post(self, _endpoint, payload, *, idempotency_key):
             self.payload = dict(payload)
-            assert idempotency_key == launch.job_id
+            assert idempotency_key == launch.remote_execution_spec["operation_id"]
             return {
                 "manifest_digest": launch.manifest_digest,
                 "success": True,
@@ -1256,10 +1302,29 @@ def test_firecracker_supervisor_preflight_fails_closed_and_plan_is_shell_free(tm
     assert FirecrackerSupervisorHTTPClient(remote_client).run(launch).success  # type: ignore[arg-type]
     assert remote_client.payload is not None
     assert "config" not in remote_client.payload
-    assert remote_client.payload["asset_request"] == dict(launch.remote_asset_request)
+    assert remote_client.payload["execution_spec"] == dict(launch.remote_execution_spec)
+    assert remote_client.payload["execution_spec_digest"] == launch.remote_execution_spec_digest
+    assert remote_client.payload["execution_spec"]["workspace_snapshot_digest"] == "c" * 64
     assert str(kernel) not in repr(remote_client.payload)
     assert str(rootfs) not in repr(remote_client.payload)
     assert str(drive) not in repr(remote_client.payload)
+
+
+def test_probe_policy_digest_commits_full_immutable_probe_manifest() -> None:
+    original = ProbeDefinition(
+        "held-out",
+        ProbeKind.COUNTEREXAMPLE,
+        "run a reviewed held-out case",
+        implementation_image_digest="a" * 64,
+        test_suite_digest="b" * 64,
+        resource_profile_digest="c" * 64,
+    )
+    changed_suite = replace(original, test_suite_digest="d" * 64)
+    changed_implementation = replace(original, implementation_image_digest="e" * 64)
+    policy_id = "reviewed-probes-v1"
+    expected = probe_policy_digest(policy_id, (original,))
+    assert expected != probe_policy_digest(policy_id, (changed_suite,))
+    assert expected != probe_policy_digest(policy_id, (changed_implementation,))
 
 
 class CountingRawExecutor:
@@ -1954,6 +2019,103 @@ def test_firecracker_requires_supervisor_signed_lifecycle_receipt(tmp_path: Path
     assert executor.execute(intent(task)).success
 
 
+def test_firecracker_reconciliation_requires_a_receipt_for_the_exact_prepared_operation(
+    tmp_path: Path,
+) -> None:
+    kernel, rootfs, drive = (tmp_path / "vmlinux", tmp_path / "rootfs.ext4", tmp_path / "job.ext4")
+    for asset in (kernel, rootfs, drive):
+        asset.write_bytes(b"asset")
+    signer = ReceiptSigner(b"r" * 32)
+    task = contract()
+    run_id = "reconciliation-run"
+
+    class ReconciliationSupervisor:
+        def run(self, _launch):
+            raise AssertionError("reconciliation must query an existing operation, never run a VM")
+
+        def reconcile(self, prepared):
+            stdout = "reconciled guest result"
+            receipt = signer.issue(
+                receipt_type="firecracker-supervisor",
+                run_id=run_id,
+                intent_digest=prepared.intent_digest,
+                candidate_artifact_digest="result-sha",
+                evaluator_image_digest="supervisor-image",
+                test_suite_digest="guest-policy",
+                result="pass",
+                contract_digest=task.contract_digest,
+                artifact_digests={"result": "result-sha"},
+                primary_artifact_name="result",
+                workspace_snapshot_digest="workspace-snapshot",
+                dependency_lock_digest="lock-digest",
+                toolchain_digest="toolchain-digest",
+                environment_digest="environment-digest",
+                verifier_policy_digest="development-supervisor-policy",
+                claims={
+                    "operation_id": prepared.operation_id,
+                    "execution_spec_digest": prepared.request_digest,
+                    "reconciliation": True,
+                    "fresh_job_drive": True,
+                    "job_drive_destroyed": True,
+                    "exit_code": 0,
+                    "result_path": "/job/vloop-result.json",
+                    "stdout_digest": digest(stdout),
+                    "stderr_digest": digest(""),
+                    "result_file_digest": "result-file-sha",
+                },
+            )
+            return GuestExecutionResult(
+                "reconciled-manifest",
+                True,
+                0,
+                stdout,
+                "",
+                {"result": "result-sha"},
+                "/job/vloop-result.json",
+                receipt.as_mapping(),
+                "result-file-sha",
+            )
+
+    executor = FirecrackerExecutor(
+        FirecrackerJobBuilder(
+            FirecrackerAssets(
+                kernel,
+                rootfs,
+                drive,
+                kernel_image_id="vloop-kernel-2026",
+                kernel_image_digest="a" * 64,
+                rootfs_image_id="vloop-rootfs-2026",
+                rootfs_digest="b" * 64,
+                resource_profile_id="isolated-small",
+                workspace_snapshot_id="workspace-snapshot-2026",
+                workspace_snapshot_digest="c" * 64,
+            )
+        ),
+        ReconciliationSupervisor(),
+        ReceiptVerifier(signer.public_key_bytes),
+    )
+    operation_id = "f" * 64
+    action = intent(task)
+    prepared = executor.prepare_execution(
+        action,
+        run_id=run_id,
+        contract_digest=task.contract_digest,
+        iteration=1,
+        operation_id=operation_id,
+        executor_id="production-firecracker",
+    )
+    observation = FirecrackerEffectReconciler(executor, "production-firecracker").reconcile(
+        run_id=run_id,
+        contract=task,
+        intent=action,
+        executor_id="production-firecracker",
+        prepared_execution=prepared,
+    )
+    assert observation.success
+    assert observation.metadata["operation_id"] == operation_id
+    assert observation.metadata["request_digest"] == prepared.request_digest
+
+
 def test_sqlite_idempotency_marks_expired_reservation_indeterminate(tmp_path: Path) -> None:
     store = SQLiteIdempotencyStore(tmp_path / "idempotency.db", lease_duration=timedelta(minutes=1))
     key = ("executor", "contract", "request", "intent-a")
@@ -2006,6 +2168,14 @@ def test_production_runtime_rejects_insecure_defaults_and_accepts_complete_recip
     kernel, rootfs, drive = (tmp_path / "vmlinux", tmp_path / "rootfs.ext4", tmp_path / "job.ext4")
     for asset in (kernel, rootfs, drive):
         asset.write_bytes(b"asset")
+    production_probe_definition = ProbeDefinition(
+        "held-out",
+        ProbeKind.COUNTEREXAMPLE,
+        "run held-out case",
+        implementation_image_digest="d" * 64,
+        test_suite_digest="e" * 64,
+        resource_profile_digest="f" * 64,
+    )
     task = TaskContract(
         "verify an isolated candidate",
         ("all protected checks pass",),
@@ -2016,25 +2186,28 @@ def test_production_runtime_rejects_insecure_defaults_and_accepts_complete_recip
             "evidence": ("artifacts",),
             "quality": ("benchmark",),
         },
-            success_condition_bindings={
-                "all protected checks pass": ("differential", "isolation", "artifacts", "benchmark"),
-            },
-            require_argument_provenance=True,
-            action_safety_checks=("structural", "isolation", "artifacts"),
-            global_completion_guards=(
-                "structural",
-                "differential",
-                "isolation",
-                "artifacts",
-                "benchmark",
-                "probe:held-out",
-            ),
-            task_kind="isolated-command",
-            risk_class="high",
-            probe_policy_digest=digest({"probe_policy_id": "held-out-command-probes-v1"}),
-            profile_version="2026.1",
-            profile_digest="q" * 64,
-        )
+        success_condition_bindings={
+            "all protected checks pass": ("differential", "isolation", "artifacts", "benchmark"),
+        },
+        require_argument_provenance=True,
+        action_safety_checks=("structural", "execution", "isolation", "artifacts"),
+        global_completion_guards=(
+            "structural",
+            "execution",
+            "differential",
+            "isolation",
+            "artifacts",
+            "benchmark",
+            "probe:held-out",
+        ),
+        task_kind="isolated-command",
+        risk_class="high",
+        probe_policy_digest=probe_policy_digest(
+            "held-out-command-probes-v1", (production_probe_definition,)
+        ),
+        profile_version="2026.1",
+        profile_digest="q" * 64,
+    )
     signer = ReceiptSigner(b"v" * 32, key_id="evaluator-2026")
 
     def signed(name: str, category: str, receipt_type: str) -> SignedReceiptVerifier:
@@ -2120,6 +2293,7 @@ def test_production_runtime_rejects_insecure_defaults_and_accepts_complete_recip
                 rootfs_digest="b" * 64,
                 resource_profile_id="isolated-small",
                 workspace_snapshot_id="workspace-snapshot-2026",
+                workspace_snapshot_digest="c" * 64,
             )
         ),
         FirecrackerSupervisorHTTPClient(service_client),
@@ -2148,7 +2322,7 @@ def test_production_runtime_rejects_insecure_defaults_and_accepts_complete_recip
     probe = ProtectedProbeRunner(
         [
             CallableProbe(
-                ProbeDefinition("held-out", ProbeKind.COUNTEREXAMPLE, "run held-out case"),
+                production_probe_definition,
                 lambda *_args: CheckResult("probe:held-out", CheckStatus.PASS, {}),
             )
         ],
@@ -2179,6 +2353,7 @@ def test_production_runtime_rejects_insecure_defaults_and_accepts_complete_recip
         HybridVerifier(
             [
                 StructuralVerifier(),
+                ExecutionVerifier(),
                 signed("differential", "correctness", "differential"),
                 signed("isolation", "policy", "isolation"),
                 signed("artifacts", "evidence", "artifacts"),
@@ -2194,9 +2369,16 @@ def test_production_runtime_rejects_insecure_defaults_and_accepts_complete_recip
         SQLiteRunStateStore(tmp_path / "run-state.db"),
         LedgerAnchorHTTPClient(service_client),
         orchestration,
+        FirecrackerEffectReconciler(raw, "production-firecracker"),
     )
     runtime = builder.build()
     assert runtime.contract.contract_digest == task.contract_digest
+    with pytest.raises(ProductionConfigurationError, match="effect_reconciler"):
+        runtime.create_loop(
+            planner=Planner(task),
+            ledger=EvidenceLedger(tmp_path / "runtime-ledger.db"),
+            effect_reconciler=None,
+        )
     with pytest.raises((AttributeError, TypeError)):
         runtime.executor = Executor()
     runtime.verifier._checks = (StructuralVerifier(),)
@@ -2345,6 +2527,48 @@ def test_controller_resumes_verified_progress_but_never_replays_a_pending_effect
     assert calls["count"] == 0
 
 
+def test_controller_persists_exact_prepared_operation_before_effect_dispatch(tmp_path: Path) -> None:
+    task = replace(contract(), maximum_iterations=1)
+    state = SQLiteRunStateStore(tmp_path / "state.db")
+    run_id = "prepared-before-dispatch"
+
+    class InspectingCrashExecutor:
+        executor_id = "prepared-executor"
+
+        def execute(self, action, capability):
+            del action, capability
+            checkpoint = state.load(run_id)
+            assert checkpoint is not None
+            assert checkpoint.phase is RunPhase.PENDING_EFFECT
+            assert checkpoint.prepared_execution is not None
+            assert checkpoint.prepared_execution.executor_id == self.executor_id
+            raise RuntimeError("simulated crash after durable operation preparation")
+
+    loop = VerifiedLoop(
+        contract=task,
+        planner=Planner(task),
+        gate=PolicyGate(task, signing_key=b"p" * 32),
+        executor=InspectingCrashExecutor(),
+        verifier=HybridVerifier([ExecutionVerifier()]),
+        ledger=EvidenceLedger(tmp_path / "ledger.db"),
+        state_store=state,
+        run_id=run_id,
+    )
+    with pytest.raises(RuntimeError, match="durable operation preparation"):
+        loop.run()
+    checkpoint = state.load(run_id)
+    assert checkpoint is not None and checkpoint.prepared_execution is not None
+    assert checkpoint.prepared_execution.operation_id == digest(
+        {
+            "run_id": run_id,
+            "iteration": 1,
+            "intent_digest": checkpoint.pending_intent.intent_digest,
+            "idempotency_key": checkpoint.pending_intent.idempotency_key,
+            "executor_id": "prepared-executor",
+        }
+    )
+
+
 def test_approval_wait_and_effect_reconciliation_are_resumable(tmp_path: Path) -> None:
     """Waiting is a live workflow phase that retains the exact pending intent."""
 
@@ -2437,7 +2661,18 @@ def test_approval_wait_and_effect_reconciliation_are_resumable(tmp_path: Path) -
     class Reconciler:
         def reconcile(self, **kwargs):
             reconciliation_calls.append(kwargs)
-            return ExecutionObservation(True, 0, "reconciled", "", {"result": "reconciled"})
+            prepared = kwargs["prepared_execution"]
+            return ExecutionObservation(
+                True,
+                0,
+                "reconciled",
+                "",
+                {"result": "reconciled"},
+                {
+                    "operation_id": prepared.operation_id,
+                    "request_digest": prepared.request_digest,
+                },
+            )
 
     reconciled = VerifiedLoop(
         contract=effect_task,
