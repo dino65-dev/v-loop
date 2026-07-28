@@ -56,6 +56,7 @@ class RunCheckpoint:
     history: tuple[dict[str, Any], ...]
     seen_failures: tuple[tuple[str, str], ...]
     evidence: EvidenceSnapshot
+    graph_digest: str = ""
     pending_intent: ActionIntent | None = None
     executor_id: str = ""
     prepared_execution: PreparedExecution | None = None
@@ -68,6 +69,8 @@ class RunCheckpoint:
     def __post_init__(self) -> None:
         if not self.run_id.strip() or not self.contract_digest.strip():
             raise ValueError("run checkpoints need a run and contract identity")
+        if self.graph_digest and (len(self.graph_digest) != 64 or any(c not in "0123456789abcdef" for c in self.graph_digest)):
+            raise ValueError("run checkpoint graph digest must be SHA-256 hex")
         if self.next_iteration < 1 or self.tool_calls < 0 or self.revision < 0:
             raise ValueError("run checkpoint counters are invalid")
         if self.evidence.run_id != self.run_id:
@@ -130,6 +133,7 @@ class SQLiteRunStateStore:
             CREATE TABLE IF NOT EXISTS run_checkpoints (
                 run_id TEXT PRIMARY KEY,
                 contract_digest TEXT NOT NULL,
+                graph_digest TEXT,
                 phase TEXT NOT NULL,
                 next_iteration INTEGER NOT NULL,
                 tool_calls INTEGER NOT NULL,
@@ -149,6 +153,7 @@ class SQLiteRunStateStore:
         )
         existing = {row[1] for row in self._connection.execute("PRAGMA table_info(run_checkpoints)").fetchall()}
         for column, declaration in (
+            ("graph_digest", "TEXT"),
             ("executor_id", "TEXT"),
             ("prepared_execution_json", "TEXT"),
             ("reconciled_observation_json", "TEXT"),
@@ -159,7 +164,7 @@ class SQLiteRunStateStore:
     def load(self, run_id: str) -> RunCheckpoint | None:
         row = self._connection.execute(
             """
-            SELECT contract_digest, phase, next_iteration, tool_calls, history_json,
+            SELECT contract_digest, graph_digest, phase, next_iteration, tool_calls, history_json,
                    seen_failures_json, evidence_json, pending_intent_json, executor_id,
                    prepared_execution_json,
                    reconciled_observation_json,
@@ -173,25 +178,27 @@ class SQLiteRunStateStore:
         return RunCheckpoint(
             run_id=run_id,
             contract_digest=row[0],
-            phase=RunPhase(row[1]),
-            next_iteration=int(row[2]),
-            tool_calls=int(row[3]),
-            history=tuple(json.loads(row[4])),
-            seen_failures=tuple(tuple(item) for item in json.loads(row[5])),
-            evidence=_decode_evidence(run_id, json.loads(row[6])),
-            pending_intent=_decode_intent(json.loads(row[7])) if row[7] else None,
-            executor_id=row[8] or "",
-            prepared_execution=_decode_prepared_execution(json.loads(row[9])) if row[9] else None,
-            reconciled_observation=_decode_observation(json.loads(row[10])) if row[10] else None,
-            terminal_decision=row[11],
-            terminal_reason=row[12],
-            revision=int(row[13]),
-            updated_at=datetime.fromisoformat(row[14]),
+            graph_digest=row[1] or "",
+            phase=RunPhase(row[2]),
+            next_iteration=int(row[3]),
+            tool_calls=int(row[4]),
+            history=tuple(json.loads(row[5])),
+            seen_failures=tuple(tuple(item) for item in json.loads(row[6])),
+            evidence=_decode_evidence(run_id, json.loads(row[7])),
+            pending_intent=_decode_intent(json.loads(row[8])) if row[8] else None,
+            executor_id=row[9] or "",
+            prepared_execution=_decode_prepared_execution(json.loads(row[10])) if row[10] else None,
+            reconciled_observation=_decode_observation(json.loads(row[11])) if row[11] else None,
+            terminal_decision=row[12],
+            terminal_reason=row[13],
+            revision=int(row[14]),
+            updated_at=datetime.fromisoformat(row[15]),
         )
 
     def save(self, checkpoint: RunCheckpoint) -> RunCheckpoint:
         encoded = (
             checkpoint.contract_digest,
+            checkpoint.graph_digest or None,
             checkpoint.phase.value,
             checkpoint.next_iteration,
             checkpoint.tool_calls,
@@ -222,11 +229,11 @@ class SQLiteRunStateStore:
                 self._connection.execute(
                     """
                     INSERT INTO run_checkpoints (
-                        run_id, contract_digest, phase, next_iteration, tool_calls,
+                        run_id, contract_digest, graph_digest, phase, next_iteration, tool_calls,
                         history_json, seen_failures_json, evidence_json, pending_intent_json,
                         executor_id, prepared_execution_json, reconciled_observation_json, terminal_decision, terminal_reason,
                         revision, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (checkpoint.run_id, *encoded, revision, now.isoformat()),
                 )
@@ -237,7 +244,7 @@ class SQLiteRunStateStore:
                 cursor = self._connection.execute(
                     """
                     UPDATE run_checkpoints
-                    SET contract_digest = ?, phase = ?, next_iteration = ?, tool_calls = ?,
+                    SET contract_digest = ?, graph_digest = ?, phase = ?, next_iteration = ?, tool_calls = ?,
                         history_json = ?, seen_failures_json = ?, evidence_json = ?,
                         pending_intent_json = ?, executor_id = ?, prepared_execution_json = ?, reconciled_observation_json = ?,
                         terminal_decision = ?, terminal_reason = ?,
@@ -255,6 +262,7 @@ class SQLiteRunStateStore:
         return RunCheckpoint(
             run_id=checkpoint.run_id,
             contract_digest=checkpoint.contract_digest,
+            graph_digest=checkpoint.graph_digest,
             phase=checkpoint.phase,
             next_iteration=checkpoint.next_iteration,
             tool_calls=checkpoint.tool_calls,

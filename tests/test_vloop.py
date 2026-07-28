@@ -42,6 +42,7 @@ from vloop.firecracker import (
     GuestExecutionResult,
     MicroVMResources,
 )
+from vloop.graph import GraphManifest, GraphNode, GraphNodeType, compile_control_graph
 from vloop.ledger import EvidenceLedger, LedgerAnchorWorker
 from vloop.learning import (
     EvaluationSlice,
@@ -268,6 +269,51 @@ def test_loop_accepts_only_after_independent_checks(tmp_path: Path) -> None:
     assert loop.run() is LoopDecision.ACCEPT
     assert ledger.verify_chain()
     assert ledger.events()[-1]["payload"]["reason"] == "verified-success"
+
+
+def test_typed_graph_kernel_binds_runs_and_rejects_unauthorised_effects(tmp_path: Path) -> None:
+    task = contract()
+    graph = compile_control_graph(task)
+    assert graph.validate().accepted
+    invalid = GraphManifest(
+        "invalid",
+        1,
+        task.contract_digest,
+        "0" * 64,
+        (GraphNode("executor.effect", GraphNodeType.EXECUTOR, effect="side-effect", authority="capability"),),
+        (),
+    )
+    assert "no authority edge" in invalid.validate().errors[0]
+
+    quality = CallableVerifier(
+        "benchmark", "quality", lambda _contract, _obs: CheckResult("benchmark", CheckStatus.PASS, {})
+    )
+    evidence = CallableVerifier(
+        "evidence", "evidence", lambda _contract, _obs: CheckResult("evidence", CheckStatus.PASS, {})
+    )
+    ledger = EvidenceLedger(tmp_path / "ledger.db")
+    loop = VerifiedLoop(
+        contract=task,
+        planner=Planner(task),
+        gate=PolicyGate(task, signing_key=b"g" * 32),
+        executor=Executor(),
+        verifier=HybridVerifier([ExecutionVerifier(), quality, evidence]),
+        ledger=ledger,
+        final_verifier=final_verifier(),
+        state_store=SQLiteRunStateStore(tmp_path / "state.db"),
+        run_id="graph-bound-run",
+    )
+    assert loop.run() is LoopDecision.ACCEPT
+    assert any(
+        event["event_type"] == "execution.observed"
+        and event["payload"]["graph_digest"] == loop.graph_digest
+        and event["payload"]["graph_node_id"] == "capability.execute"
+        for event in ledger.events()
+    )
+    persisted = loop.state_store.load("graph-bound-run")  # type: ignore[union-attr]
+    assert persisted is not None and persisted.graph_digest == loop.graph_digest
+    evidence_graph = loop.evidence_graph()
+    assert evidence_graph.nodes and "digraph vloop_evidence" in evidence_graph.to_dot()
 
 
 def test_failed_execution_cannot_advance_criteria_even_if_a_verifier_is_wrong(tmp_path: Path) -> None:

@@ -38,6 +38,8 @@ def capability_payload(capability: Capability) -> bytes:
             "executor_id": capability.executor_id,
             "issued_at": capability.issued_at.isoformat(),
             "expires_at": capability.expires_at.isoformat(),
+            "graph_digest": capability.graph_digest,
+            "graph_node_id": capability.graph_node_id,
         }
     ).encode("utf-8")
 
@@ -69,6 +71,8 @@ class CapabilitySigner:
         executor_id: str,
         issued_at: datetime,
         expires_at: datetime,
+        graph_digest: str = "",
+        graph_node_id: str = "",
     ) -> Capability:
         if not executor_id.strip():
             raise ValueError("capability needs a non-empty executor audience")
@@ -81,6 +85,8 @@ class CapabilitySigner:
             issued_at=issued_at,
             expires_at=expires_at,
             signature="",
+            graph_digest=graph_digest,
+            graph_node_id=graph_node_id,
         )
         signature = base64.urlsafe_b64encode(self._private_key.sign(capability_payload(capability))).decode(
             "ascii"
@@ -94,6 +100,8 @@ class CapabilitySigner:
             issued_at=capability.issued_at,
             expires_at=capability.expires_at,
             signature=signature,
+            graph_digest=capability.graph_digest,
+            graph_node_id=capability.graph_node_id,
         )
 
 

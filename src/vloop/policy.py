@@ -428,6 +428,8 @@ class PolicyGate:
         *,
         executor_id: str,
         approvals: Iterable[Approval | SignedApprovalReceipt] = (),
+        graph_digest: str = "",
+        graph_node_id: str = "",
         now: datetime | None = None,
     ) -> Capability:
         now = now or datetime.now(UTC)
@@ -499,6 +501,8 @@ class PolicyGate:
             executor_id=executor_id,
             issued_at=now,
             expires_at=expires_at,
+            graph_digest=graph_digest,
+            graph_node_id=graph_node_id,
         )
 
     def validate_and_consume(

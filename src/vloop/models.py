@@ -374,6 +374,16 @@ class Capability:
     issued_at: datetime
     expires_at: datetime
     signature: str
+    graph_digest: str = ""
+    graph_node_id: str = ""
+
+    def __post_init__(self) -> None:
+        if bool(self.graph_digest) != bool(self.graph_node_id):
+            raise ValueError("capability graph binding needs both digest and node id")
+        if self.graph_digest and (
+            len(self.graph_digest) != 64 or any(character not in "0123456789abcdef" for character in self.graph_digest)
+        ):
+            raise ValueError("capability graph digest must be SHA-256 hex")
 
 
 @dataclass(frozen=True, slots=True)

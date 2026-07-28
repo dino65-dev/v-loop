@@ -12,6 +12,7 @@ from .completion import ActionSafetyReport, EvidenceAccumulator, FinalVerifier, 
 from .context import ContextPackage, ContextTrust
 from .evaluation import ProtectedEvaluationOrchestrator
 from .executor import Executor
+from .graph import EvidenceGraph, GraphManifest, build_evidence_graph, compile_control_graph
 from .ledger import EvidenceLedger
 from .memory import MemoryCandidateProducer, VerifiedMemoryCommitter
 from .models import (
@@ -109,12 +110,19 @@ class VerifiedLoop:
         self.state_store = state_store
         self.effect_reconciler = effect_reconciler
         self.evaluation_orchestrator = evaluation_orchestrator
+        self.graph_manifest: GraphManifest = compile_control_graph(contract)
+        self.graph_digest = self.graph_manifest.graph_digest
         self.run_id = run_id or str(uuid4())
         self._evidence = EvidenceAccumulator(self.run_id)
         self._history: list[dict] = []
         self._seen_failures: set[tuple[str, str]] = set()
         self._tool_calls = 0
         self._checkpoint: RunCheckpoint | None = None
+
+    def evidence_graph(self) -> EvidenceGraph:
+        """Return a hash-addressed graph projection of this run's ledger evidence."""
+
+        return build_evidence_graph(self.ledger.events(), run_id=self.run_id)
 
     def run(self, approvals: Iterable[Approval | SignedApprovalReceipt] = ()) -> LoopDecision:
         resumed_terminal = self._restore_or_start()
@@ -175,6 +183,8 @@ class VerifiedLoop:
                         intent,
                         executor_id=self.executor.executor_id,
                         approvals=approvals,
+                        graph_digest=self.graph_digest,
+                        graph_node_id="capability.execute",
                     )
                 except PolicyDenied as exc:
                     reason = str(exc)
@@ -220,6 +230,8 @@ class VerifiedLoop:
                         "intent_digest": intent.intent_digest,
                         "capability_id": capability.capability_id,
                         "executor_id": capability.executor_id,
+                        "graph_digest": capability.graph_digest,
+                        "graph_node_id": capability.graph_node_id,
                         "operation_id": prepared_execution.operation_id,
                         "request_digest": prepared_execution.request_digest,
                         "success": observation.success,
@@ -450,7 +462,11 @@ class VerifiedLoop:
         if self.state_store is None:
             self.ledger.append(
                 "run.started",
-                {"run_id": self.run_id, "contract_digest": self.contract.contract_digest},
+                {
+                    "run_id": self.run_id,
+                    "contract_digest": self.contract.contract_digest,
+                    "graph_digest": self.graph_digest,
+                },
             )
             return None
         checkpoint = self.state_store.load(self.run_id)
@@ -458,6 +474,7 @@ class VerifiedLoop:
             checkpoint = RunCheckpoint(
                 run_id=self.run_id,
                 contract_digest=self.contract.contract_digest,
+                graph_digest=self.graph_digest,
                 phase=RunPhase.READY,
                 next_iteration=1,
                 tool_calls=0,
@@ -468,11 +485,17 @@ class VerifiedLoop:
             self._checkpoint = self.state_store.save(checkpoint)
             self.ledger.append(
                 "run.started",
-                {"run_id": self.run_id, "contract_digest": self.contract.contract_digest},
+                {
+                    "run_id": self.run_id,
+                    "contract_digest": self.contract.contract_digest,
+                    "graph_digest": self.graph_digest,
+                },
             )
             return None
         if checkpoint.contract_digest != self.contract.contract_digest:
             raise ValueError("persisted run state belongs to a different task contract")
+        if checkpoint.graph_digest and checkpoint.graph_digest != self.graph_digest:
+            raise ValueError("persisted run state belongs to a different control graph")
         if checkpoint.next_iteration > self.contract.maximum_iterations + 1:
             raise ValueError("persisted run state exceeds the contract iteration budget")
         self._checkpoint = checkpoint
@@ -541,6 +564,7 @@ class VerifiedLoop:
         checkpoint = RunCheckpoint(
             run_id=self.run_id,
             contract_digest=self.contract.contract_digest,
+            graph_digest=self.graph_digest,
             phase=phase,
             next_iteration=next_iteration,
             tool_calls=self._tool_calls,
