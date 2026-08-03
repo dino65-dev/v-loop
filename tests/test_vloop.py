@@ -51,13 +51,23 @@ from vloop.graph import (
     GraphNodeType,
     compile_control_graph,
 )
+from vloop.graph_schema import NodeImplementation, NodePort, PortDirection, schema_digest
 from vloop.graph_benchmark import GraphRunMetric, summarize_graph_benchmark
 from vloop.harness_evolution import (
     HarnessChangeProposal,
     HarnessChangeStatus,
     HarnessComponent,
     HarnessRegistry,
-    ShadowEvaluation,
+)
+from vloop.harness_experiments import (
+    GraphExperimentKey,
+    HarnessEvaluationBundle,
+    HarnessEvaluationSigner,
+    HarnessEvaluationVerifier,
+    HarnessReviewSigner,
+    HarnessReviewVerifier,
+    MetricDirection,
+    PairedRunEvidence,
 )
 from vloop.ledger import EvidenceLedger, LedgerAnchorWorker
 from vloop.learning import (
@@ -336,6 +346,13 @@ def test_typed_graph_kernel_binds_runs_and_rejects_unauthorised_effects(tmp_path
 
 def test_dynamic_graphs_are_read_only_acyclic_and_contract_bound() -> None:
     task = contract()
+    value_schema = schema_digest("DynamicValue.v1")
+    implementation = NodeImplementation("read-only-template", "a" * 64, (value_schema,), (value_schema,), 100, 1, 30)
+    node_metadata = {
+        "implementation_id": implementation.implementation_id,
+        "implementation_digest": implementation.implementation_digest,
+        "maximum_tokens": "10",
+    }
     reasoning_graph = GraphManifest(
         "reasoning",
         1,
@@ -343,30 +360,31 @@ def test_dynamic_graphs_are_read_only_acyclic_and_contract_bound() -> None:
         "0" * 64,
         (
             GraphNode("task", GraphNodeType.TASK),
-            GraphNode("context", GraphNodeType.CONTEXT),
-            GraphNode("candidate", GraphNodeType.ACTION, metadata={"terminal": "true"}),
+            GraphNode("context", GraphNodeType.CONTEXT, budget=1, timeout_seconds=30, metadata=node_metadata, output_ports=(NodePort("context", PortDirection.OUTPUT, value_schema),)),
+            GraphNode("candidate", GraphNodeType.ACTION, budget=1, timeout_seconds=30, metadata={**node_metadata, "terminal": "true"}, input_ports=(NodePort("context", PortDirection.INPUT, value_schema),), output_ports=(NodePort("result", PortDirection.OUTPUT, value_schema),)),
         ),
         (
             GraphEdge("task", "context", GraphEdgeType.DEPENDS_ON),
-            GraphEdge("context", "candidate", GraphEdgeType.DERIVED_FROM),
+            GraphEdge("context", "candidate", GraphEdgeType.DERIVED_FROM, source_port="context", target_port="context"),
         ),
         metadata={"mode": "read-only-reasoning"},
     )
-    assert DynamicSubgraphPolicy().admit(reasoning_graph, contract=task) == reasoning_graph
+    policy = DynamicSubgraphPolicy(implementations={implementation.implementation_id: implementation})
+    assert policy.admit(reasoning_graph, contract=task) == reasoning_graph
 
     authority_graph = replace(
         reasoning_graph,
         nodes=reasoning_graph.nodes + (GraphNode("cap", GraphNodeType.CAPABILITY, authority="policy"),),
     )
     with pytest.raises(PermissionError, match="exceeds read-only authority"):
-        DynamicSubgraphPolicy().admit(authority_graph, contract=task)
+        policy.admit(authority_graph, contract=task)
 
     cycle_graph = replace(
         reasoning_graph,
         edges=reasoning_graph.edges + (GraphEdge("candidate", "context", GraphEdgeType.DEPENDS_ON),),
     )
     with pytest.raises(PermissionError, match="acyclic"):
-        DynamicSubgraphPolicy().admit(cycle_graph, contract=task)
+        policy.admit(cycle_graph, contract=task)
 
 
 def test_static_graph_analysis_detects_authority_memory_and_cycle_violations() -> None:
@@ -430,17 +448,23 @@ def test_harness_changes_require_immutable_shadow_threshold_and_independent_prom
         ("code",),
     )
     registry.propose(proposal)
-    assert registry.record_shadow(ShadowEvaluation("change-1", 0.50, 0.58, True, 0.55)) is HarnessChangeStatus.REJECTED
-
-    proposal_two = replace(proposal, change_id="change-2")
-    registry.propose(proposal_two)
-    assert registry.record_shadow(ShadowEvaluation("change-2", 0.50, 0.65, True, 0.60)) is HarnessChangeStatus.SHADOW_PASSED
-    with pytest.raises(PermissionError, match="cannot promote"):
-        registry.promote("change-2", reviewer_id="author-a")
-    assert registry.promote("change-2", reviewer_id="reviewer-b").version == "2"
-    assert registry.status("change-2") is HarnessChangeStatus.PROMOTED
-    assert registry.rollback("change-2", reviewer_id="reviewer-c").version == "1"
-    assert registry.status("change-2") is HarnessChangeStatus.ROLLED_BACK
+    with pytest.raises(PermissionError, match="unsigned shadow"):
+        registry.record_shadow(None)  # type: ignore[arg-type]
+    key = GraphExperimentKey("b" * 64, "c" * 64, "deepseek-v4-flash", "d" * 64, "e" * 64, "f" * 64, "1" * 64, 100)
+    candidate_key = replace(key, harness_bundle_digest="2" * 64)
+    pair = PairedRunEvidence("task-1", 7, "baseline", "candidate", "3" * 64, "4" * 64, {"held-out accuracy": 0.5, "false_acceptance": 0.0, "policy_violation": 0.0}, {"held-out accuracy": 0.7, "false_acceptance": 0.0, "policy_violation": 0.0})
+    signer = HarnessEvaluationSigner(b"h" * 32, signer_id="evaluator")
+    bundle = signer.sign(HarnessEvaluationBundle("change-1", key, candidate_key, "held-out accuracy", MetricDirection.MAXIMIZE, 0.1, 1, (pair,), "evaluator"))
+    evaluator = HarnessEvaluationVerifier({"evaluator": signer.public_key_bytes})
+    assert registry.record_signed_shadow(bundle, verifier=evaluator) is HarnessChangeStatus.SHADOW_PASSED
+    with pytest.raises(PermissionError, match="unsigned reviewer"):
+        registry.promote("change-1", reviewer_id="reviewer-b")
+    reviewer = HarnessReviewSigner(b"r" * 32, signer_id="review-key")
+    review_verifier = HarnessReviewVerifier({"review-key": reviewer.public_key_bytes})
+    assert registry.promote_signed("change-1", reviewer.issue(change_id="change-1", reviewer_id="reviewer-b", role="harness-promoter"), verifier=review_verifier).version == "2"
+    assert registry.status("change-1") is HarnessChangeStatus.PROMOTED
+    assert registry.rollback_signed("change-1", reviewer.issue(change_id="change-1", reviewer_id="reviewer-c", role="harness-rollback"), verifier=review_verifier).version == "1"
+    assert registry.status("change-1") is HarnessChangeStatus.ROLLED_BACK
 
 
 def test_graph_benchmarks_report_measured_topology_tradeoffs() -> None:

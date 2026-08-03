@@ -245,9 +245,12 @@ class ProtectedEvaluatorHTTPClient:
         test_suite_digest: str,
         graph_digest: str = "",
         graph_node_id: str = "",
+        graph_node_instance_id: str = "",
     ) -> Mapping[str, Any]:
         if bool(graph_digest) != bool(graph_node_id):
             raise ValueError("protected evaluation graph digest and node must be supplied together")
+        if graph_node_instance_id and not graph_digest:
+            raise ValueError("protected evaluation node instance needs a graph binding")
         payload = {
             "run_id": run_id,
             "contract_digest": contract_digest,
@@ -259,11 +262,12 @@ class ProtectedEvaluatorHTTPClient:
             "test_suite_digest": test_suite_digest,
             "graph_digest": graph_digest,
             "graph_node_id": graph_node_id,
+            "graph_node_instance_id": graph_node_instance_id,
         }
         response = self.client.post(
             self.endpoint,
             payload,
-            idempotency_key=digest({"run_id": run_id, "intent_digest": intent_digest, "receipt_type": receipt_type, "graph_digest": graph_digest, "graph_node_id": graph_node_id}),
+            idempotency_key=digest({"run_id": run_id, "intent_digest": intent_digest, "receipt_type": receipt_type, "graph_digest": graph_digest, "graph_node_id": graph_node_id, "graph_node_instance_id": graph_node_instance_id}),
         )
         receipt = response.get("receipt")
         if not isinstance(receipt, Mapping):

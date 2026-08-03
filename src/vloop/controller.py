@@ -13,6 +13,8 @@ from .context import ContextPackage, ContextTrust
 from .evaluation import ProtectedEvaluationOrchestrator
 from .executor import Executor
 from .graph import EvidenceGraph, GraphManifest, build_evidence_graph, compile_control_graph
+from .graph_events import CausalEvent, GraphEventStore, SemanticEvidenceGraph, build_semantic_evidence_graph
+from .graph_runtime import DurableGraphScheduler
 from .ledger import EvidenceLedger
 from .memory import MemoryCandidateProducer, VerifiedMemoryCommitter
 from .models import (
@@ -93,6 +95,7 @@ class VerifiedLoop:
         run_id: str | None = None,
         effect_reconciler: EffectReconciler | None = None,
         evaluation_orchestrator: ProtectedEvaluationOrchestrator | None = None,
+        graph_scheduler: DurableGraphScheduler | None = None,
     ) -> None:
         self.contract = contract
         self.planner = planner
@@ -113,6 +116,11 @@ class VerifiedLoop:
         self.graph_manifest: GraphManifest = compile_control_graph(contract)
         self.graph_digest = self.graph_manifest.graph_digest
         self.run_id = run_id or str(uuid4())
+        graph_database = getattr(state_store, "path", ":memory:")
+        self.graph_event_store = GraphEventStore(graph_database)
+        self.graph_scheduler = graph_scheduler or DurableGraphScheduler(
+            self.graph_manifest, self.graph_event_store, graph_database
+        )
         self._evidence = EvidenceAccumulator(self.run_id)
         self._history: list[dict] = []
         self._seen_failures: set[tuple[str, str]] = set()
@@ -124,12 +132,18 @@ class VerifiedLoop:
 
         return build_evidence_graph(self.ledger.events(), run_id=self.run_id)
 
+    def causal_evidence_graph(self) -> SemanticEvidenceGraph:
+        """Return the semantic causal graph, not a projection of ledger ordering."""
+
+        return build_semantic_evidence_graph(self.graph_event_store.events(run_id=self.run_id), run_id=self.run_id)
+
     def run(self, approvals: Iterable[Approval | SignedApprovalReceipt] = ()) -> LoopDecision:
         resumed_terminal = self._restore_or_start()
         if resumed_terminal is not None:
             return resumed_terminal
         start_iteration = self._checkpoint.next_iteration if self._checkpoint is not None else 1
         for iteration in range(start_iteration, self.contract.maximum_iterations + 1):
+            self._graph_begin_iteration(iteration)
             if self._tool_calls >= self.contract.maximum_tool_calls:
                 return self._terminal(LoopDecision.STOP, "tool-call-budget-exhausted")
             reconciled = self._checkpoint is not None and self._checkpoint.phase is RunPhase.RECONCILED_EFFECT
@@ -154,6 +168,14 @@ class VerifiedLoop:
                         "artifact_digests": dict(observation.artifact_digests),
                     },
                 )
+                if observation.success:
+                    self._graph_advance(
+                        iteration,
+                        "artifact.manifest",
+                        "artifact.reconciled",
+                        {"success": True},
+                        output_artifacts=observation.artifact_digests,
+                    )
             elif self._checkpoint is not None and self._checkpoint.phase in {
                 RunPhase.PENDING_AUTHORIZATION,
                 RunPhase.AWAITING_APPROVAL,
@@ -166,6 +188,13 @@ class VerifiedLoop:
                 )
             else:
                 intent = self._propose()
+                matched_rule_index = self._matching_action_rule_index(intent)
+                self._graph_advance(
+                    iteration,
+                    "action.intent",
+                    "intent.proposed",
+                    {"intent_digest": intent.intent_digest, "rule_index": str(matched_rule_index)},
+                )
                 self.ledger.append(
                     "intent.proposed",
                     {
@@ -199,11 +228,27 @@ class VerifiedLoop:
                         return self._await_approval(iteration, intent, reason)
                     return self._terminal(LoopDecision.ESCALATE, "policy-denied")
 
+                self._graph_authorise_action_rule(iteration, intent)
+                self._graph_advance(
+                    iteration,
+                    "capability.execute",
+                    "capability.authorised",
+                    {"capability_id": capability.capability_id, "intent_digest": intent.intent_digest},
+                    authorization_ref=capability.capability_id,
+                )
+
                 self._tool_calls += 1
                 # Persist before the effect starts. A process death after this
                 # transition is never retried by the controller; the executor's
                 # idempotency/supervisor record must be reconciled first.
                 prepared_execution = self._prepare_execution(iteration, intent)
+                self._graph_advance(
+                    iteration,
+                    "operation.prepared",
+                    "operation.prepared",
+                    {"operation_id": prepared_execution.operation_id},
+                    authorization_ref=capability.capability_id,
+                )
                 self._checkpoint_pending_effect(iteration, intent, prepared_execution)
                 self.ledger.append(
                     "execution.started",
@@ -221,12 +266,28 @@ class VerifiedLoop:
                 binder = getattr(self.executor, "bind_run", None)
                 if callable(binder):
                     binder(self.run_id, self.contract.contract_digest)
+                self._graph_advance(
+                    iteration,
+                    "executor.effect",
+                    "execution.dispatched",
+                    {"success": None, "operation_id": prepared_execution.operation_id},
+                    authorization_ref=capability.capability_id,
+                )
                 execute_prepared = getattr(self.executor, "execute_prepared", None)
                 observation = (
                     execute_prepared(intent, capability, prepared_execution)
                     if callable(execute_prepared)
                     else self.executor.execute(intent, capability)
                 )
+                if observation.success:
+                    self._graph_advance(
+                        iteration,
+                        "artifact.manifest",
+                        "artifact.produced",
+                        {"success": True},
+                        output_artifacts=observation.artifact_digests,
+                        authorization_ref=capability.capability_id,
+                    )
                 execution_event_hash = self.ledger.append(
                     "execution.observed",
                     {
@@ -248,6 +309,11 @@ class VerifiedLoop:
                 )
             if self.evaluation_orchestrator is not None:
                 try:
+                    evaluator_event = None
+                    if observation.success:
+                        evaluator_event = self._graph_advance(
+                            iteration, "evaluator.protected", "evaluation.requested", {}
+                        )
                     bundle = self.evaluation_orchestrator.evaluate(
                         run_id=self.run_id,
                         contract=self.contract,
@@ -255,6 +321,9 @@ class VerifiedLoop:
                         observation=observation,
                         graph_digest=self.graph_digest,
                         graph_node_id="evaluator.protected",
+                        graph_node_instance_id=(
+                            evaluator_event.node_instance_id if evaluator_event is not None else ""
+                        ),
                     )
                     existing_receipts = observation.metadata.get("evaluator_receipts", {})
                     merged_receipts = (
@@ -271,6 +340,9 @@ class VerifiedLoop:
                             "workspace_exclusion_policy_digest": bundle.workspace_snapshot.exclusion_policy_digest,
                             "receipt_graph_digest": self.graph_digest,
                             "receipt_graph_node_id": "evaluator.protected",
+                            "receipt_graph_node_instance_id": (
+                                evaluator_event.node_instance_id if evaluator_event is not None else ""
+                            ),
                         },
                     )
                     self.ledger.append(
@@ -363,6 +435,7 @@ class VerifiedLoop:
             ):
                 final_check, _final_event_hash = self._verify_final_goal(report)
                 if final_check.status is CheckStatus.PASS:
+                    self._graph_accept(iteration, final_check, observation)
                     self._commit_verified_memory(
                         report=report,
                         final_check=final_check,
@@ -393,6 +466,7 @@ class VerifiedLoop:
             if report.accepted and observation.success:
                 final_check, final_event_hash = self._verify_final_goal(report)
                 if final_check.status is CheckStatus.PASS:
+                    self._graph_accept(iteration, final_check, observation)
                     self._commit_verified_memory(
                         report=report,
                         final_check=final_check,
@@ -556,6 +630,112 @@ class VerifiedLoop:
             },
         )
         return None
+
+    def _graph_begin_iteration(self, iteration: int) -> None:
+        """Start the immutable graph path before the controller can propose work."""
+
+        state = self.graph_scheduler.state(run_id=self.run_id, iteration=iteration)
+        if state.completed:
+            return
+        self._graph_advance(iteration, "task.contract", "task.bound", {"contract_digest": self.contract.contract_digest})
+        self._graph_advance(iteration, "principal.contract", "principal.bound", {})
+        self._graph_advance(iteration, "snapshot.workspace", "snapshot.requested", {})
+
+    def _graph_advance(
+        self,
+        iteration: int,
+        template_node_id: str,
+        event_type: str,
+        payload: Mapping[str, object],
+        *,
+        output_artifacts: Mapping[str, str] = {},
+        authorization_ref: str = "",
+        receipt_refs: tuple[str, ...] = (),
+    ) -> CausalEvent | None:
+        """Advance only a graph-enabled node and retain an explicit causal link."""
+
+        state = self.graph_scheduler.state(run_id=self.run_id, iteration=iteration)
+        if template_node_id in state.completed:
+            return next(
+                (
+                    event
+                    for event in reversed(self.graph_event_store.events(run_id=self.run_id))
+                    if event.template_node_id == template_node_id
+                    and event.node_instance_id
+                    and event.run_id == self.run_id
+                ),
+                None,
+            )
+        existing = self.graph_event_store.events(run_id=self.run_id)
+        parent = (existing[-1].event_id,) if existing else ()
+        return self.graph_scheduler.advance(
+            run_id=self.run_id,
+            iteration=iteration,
+            template_node_id=template_node_id,
+            event_type=event_type,
+            payload=payload,
+            causal_parents=parent,
+            output_artifacts=output_artifacts,
+            authorization_ref=authorization_ref,
+            receipt_refs=receipt_refs,
+        ).event
+
+    def _matching_action_rule_index(self, intent: ActionIntent) -> int:
+        """Use the same closed rule shape as policy before the graph advances."""
+
+        for index, rule in enumerate(self.contract.allowed_actions):
+            prefix = rule.target_prefix.rstrip("/") or "/"
+            if (
+                rule.tool == intent.tool
+                and rule.effect is intent.effect
+                and (prefix == "/" or intent.target == prefix or intent.target.startswith(prefix + "/"))
+            ):
+                return index
+        raise PolicyDenied("no action rule matches the proposed intent")
+
+    def _graph_authorise_action_rule(self, iteration: int, intent: ActionIntent) -> None:
+        """Make the selected contract rule (and its approval edge) executable."""
+
+        index = self._matching_action_rule_index(intent)
+        rule = self.contract.allowed_actions[index]
+        self._graph_advance(iteration, f"action.rule.{index}", "action.rule.matched", {"rule_index": str(index)})
+        if rule.approval_required:
+            self._graph_advance(iteration, f"approval.rule.{index}", "approval.consumed", {"rule_index": str(index)})
+        self._graph_advance(iteration, "join.action.authority.any", "action.authority.joined", {})
+
+    def _graph_accept(
+        self,
+        iteration: int,
+        final_check: CheckResult,
+        observation: ExecutionObservation,
+    ) -> None:
+        """Emit the ALL-guard barrier before the controller is allowed to accept."""
+
+        self._graph_advance(iteration, "evaluator.protected", "evaluation.completed", {})
+        raw_receipts = observation.metadata.get("evaluator_receipts", {})
+        receipts = raw_receipts if isinstance(raw_receipts, Mapping) else {}
+        receipt_refs = tuple(
+            str(value.get("event_hash", ""))
+            for value in receipts.values()
+            if isinstance(value, Mapping) and value.get("event_hash")
+        )
+        for node in self.graph_manifest.nodes:
+            if node.node_type.value == "evaluator" and node.node_id != "evaluator.protected":
+                self._graph_advance(iteration, node.node_id, "evaluation.check.completed", {"passed": True})
+        for node in self.graph_manifest.nodes:
+            if node.node_type.value == "receipt":
+                self._graph_advance(
+                    iteration,
+                    node.node_id,
+                    "receipt.accepted",
+                    {"passed": True, "final_goal": final_check.status.value},
+                    receipt_refs=receipt_refs,
+                )
+        for node in self.graph_manifest.nodes:
+            if node.node_type.value == "criterion":
+                self._graph_advance(iteration, node.node_id, "criterion.satisfied", {"passed": True})
+        self._graph_advance(iteration, "join.guards.all", "guards.joined", {})
+        self._graph_advance(iteration, "decision.accept", "decision.accepted", {"decision": "accept"})
 
     def _save_checkpoint(
         self,

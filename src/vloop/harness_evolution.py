@@ -12,6 +12,12 @@ from typing import Mapping
 from uuid import uuid4
 
 from .canonical import canonical_json, digest
+from .harness_experiments import (
+    HarnessEvaluationBundle,
+    HarnessEvaluationVerifier,
+    HarnessReviewReceipt,
+    HarnessReviewVerifier,
+)
 
 
 class HarnessChangeStatus(StrEnum):
@@ -139,25 +145,47 @@ class HarnessRegistry:
         )
 
     def record_shadow(self, evaluation: ShadowEvaluation) -> HarnessChangeStatus:
+        del evaluation
+        raise PermissionError("unsigned shadow results cannot promote harness changes")
+
+    def record_signed_shadow(
+        self,
+        bundle: HarnessEvaluationBundle,
+        *,
+        verifier: HarnessEvaluationVerifier,
+    ) -> HarnessChangeStatus:
+        verifier.validate(bundle)
         row = self._connection.execute(
-            "SELECT proposal_json, status FROM harness_changes WHERE change_id = ?", (evaluation.change_id,)
+            "SELECT proposal_json, status FROM harness_changes WHERE change_id = ?", (bundle.change_id,)
         ).fetchone()
         if row is None or row[1] != HarnessChangeStatus.PROPOSED.value:
             raise ValueError("only proposed harness changes may receive shadow evidence")
         proposal = _decode_proposal(row[0])
-        passed = (
-            evaluation.held_out_passed
-            and evaluation.improvement >= proposal.minimum_improvement
-            and evaluation.observed_score >= evaluation.rollback_threshold
-        )
-        status = HarnessChangeStatus.SHADOW_PASSED if passed else HarnessChangeStatus.REJECTED
+        if bundle.primary_metric != proposal.predicted_metric or bundle.improvement < proposal.minimum_improvement:
+            raise PermissionError("signed shadow evidence does not satisfy its immutable proposal")
         self._connection.execute(
             "UPDATE harness_changes SET status = ?, shadow_json = ?, updated_at = ? WHERE change_id = ?",
-            (status.value, _encode_shadow(evaluation), _now(), evaluation.change_id),
+            (HarnessChangeStatus.SHADOW_PASSED.value, canonical_json({"bundle": bundle.payload().decode("utf-8"), "signature": bundle.signature}), _now(), bundle.change_id),
         )
-        return status
+        return HarnessChangeStatus.SHADOW_PASSED
 
     def promote(self, change_id: str, *, reviewer_id: str) -> HarnessComponent:
+        del change_id, reviewer_id
+        raise PermissionError("unsigned reviewer identity cannot promote a harness change")
+
+    def promote_signed(
+        self,
+        change_id: str,
+        receipt: HarnessReviewReceipt,
+        *,
+        verifier: HarnessReviewVerifier,
+    ) -> HarnessComponent:
+        if receipt.change_id != change_id:
+            raise PermissionError("review receipt targets another harness change")
+        verifier.validate_review(receipt, role="harness-promoter")
+        return self._promote(change_id, reviewer_id=receipt.reviewer_id)
+
+    def _promote(self, change_id: str, *, reviewer_id: str) -> HarnessComponent:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             row = self._connection.execute(
@@ -188,6 +216,22 @@ class HarnessRegistry:
             raise
 
     def rollback(self, change_id: str, *, reviewer_id: str) -> HarnessComponent:
+        del change_id, reviewer_id
+        raise PermissionError("unsigned reviewer identity cannot roll back a harness change")
+
+    def rollback_signed(
+        self,
+        change_id: str,
+        receipt: HarnessReviewReceipt,
+        *,
+        verifier: HarnessReviewVerifier,
+    ) -> HarnessComponent:
+        if receipt.change_id != change_id:
+            raise PermissionError("review receipt targets another harness change")
+        verifier.validate_review(receipt, role="harness-rollback")
+        return self._rollback(change_id, reviewer_id=receipt.reviewer_id)
+
+    def _rollback(self, change_id: str, *, reviewer_id: str) -> HarnessComponent:
         """Restore the retained baseline without overwriting a newer component version."""
 
         self._connection.execute("BEGIN IMMEDIATE")

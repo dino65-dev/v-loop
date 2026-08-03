@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Iterable, Mapping
 
 from .canonical import digest
+from .graph_schema import (
+    GraphJoin,
+    GraphPredicate,
+    JoinPolicy,
+    NodeImplementation,
+    NodePort,
+    PortDirection,
+    PredicateKind,
+    schema_digest,
+)
 from .models import TaskContract
 
 
@@ -26,6 +36,7 @@ class GraphNodeType(StrEnum):
     DECISION = "decision"
     MEMORY = "memory"
     CONTEXT = "context"
+    JOIN = "join"
 
 
 class GraphEdgeType(StrEnum):
@@ -50,6 +61,8 @@ class GraphNode:
     budget: int | None = None
     timeout_seconds: int | None = None
     required_guards: tuple[str, ...] = ()
+    input_ports: tuple[NodePort, ...] = ()
+    output_ports: tuple[NodePort, ...] = ()
     metadata: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -63,6 +76,13 @@ class GraphNode:
             raise ValueError("graph node budgets must be positive")
         if self.timeout_seconds is not None and self.timeout_seconds < 1:
             raise ValueError("graph node timeouts must be positive")
+        ports = self.input_ports + self.output_ports
+        if len({port.name for port in ports}) != len(ports):
+            raise ValueError("node port names must be unique across inputs and outputs")
+        if any(port.direction is not PortDirection.INPUT for port in self.input_ports) or any(
+            port.direction is not PortDirection.OUTPUT for port in self.output_ports
+        ):
+            raise ValueError("node ports must match their declared direction")
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,10 +91,17 @@ class GraphEdge:
     target: str
     edge_type: GraphEdgeType
     condition: str = ""
+    source_port: str = ""
+    target_port: str = ""
+    predicate: GraphPredicate = GraphPredicate()
 
     def __post_init__(self) -> None:
         if not self.source.strip() or not self.target.strip():
             raise ValueError("graph edges need source and target")
+        if bool(self.source_port) != bool(self.target_port):
+            raise ValueError("typed edges need both source and target ports")
+        if self.condition not in {"", "execution.success", "outcome-unknown-or-failed", "guard-pass"}:
+            raise ValueError("graph edges must use a closed predicate vocabulary")
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +117,41 @@ class GraphValidationReport:
             raise ValueError("invalid V-Loop graph: " + "; ".join(self.errors))
 
 
+_EDGE_COMPATIBILITY: Mapping[GraphEdgeType, frozenset[tuple[GraphNodeType, GraphNodeType]]] = {
+    GraphEdgeType.AUTHORISED_BY: frozenset(
+        {
+            (GraphNodeType.ACTION, GraphNodeType.APPROVAL),
+            (GraphNodeType.PRINCIPAL, GraphNodeType.CAPABILITY),
+            (GraphNodeType.APPROVAL, GraphNodeType.CAPABILITY),
+            (GraphNodeType.CAPABILITY, GraphNodeType.OPERATION),
+        }
+    ),
+    GraphEdgeType.DISPATCHED_TO: frozenset({(GraphNodeType.OPERATION, GraphNodeType.EXECUTOR)}),
+    GraphEdgeType.PRODUCED: frozenset(
+        {(GraphNodeType.EXECUTOR, GraphNodeType.ARTIFACT), (GraphNodeType.EVALUATOR, GraphNodeType.RECEIPT)}
+    ),
+    GraphEdgeType.VERIFIED_BY: frozenset(
+        {(GraphNodeType.ARTIFACT, GraphNodeType.EVALUATOR), (GraphNodeType.RECEIPT, GraphNodeType.CRITERION)}
+    ),
+    GraphEdgeType.SATISFIES: frozenset(
+        {
+            (GraphNodeType.ACTION, GraphNodeType.JOIN),
+            (GraphNodeType.APPROVAL, GraphNodeType.JOIN),
+            (GraphNodeType.CRITERION, GraphNodeType.JOIN),
+            (GraphNodeType.JOIN, GraphNodeType.CAPABILITY),
+            (GraphNodeType.JOIN, GraphNodeType.DECISION),
+        }
+    ),
+    GraphEdgeType.RECONCILES: frozenset({(GraphNodeType.EXECUTOR, GraphNodeType.OPERATION)}),
+    GraphEdgeType.REQUIRES: frozenset({(GraphNodeType.SNAPSHOT, GraphNodeType.EVALUATOR)}),
+}
+
+
+def _edge_pair_is_valid(source: GraphNodeType, edge_type: GraphEdgeType, target: GraphNodeType) -> bool:
+    allowed = _EDGE_COMPATIBILITY.get(edge_type)
+    return allowed is None or (source, target) in allowed
+
+
 @dataclass(frozen=True, slots=True)
 class GraphManifest:
     graph_id: str
@@ -100,6 +162,7 @@ class GraphManifest:
     edges: tuple[GraphEdge, ...]
     compiler_version: str = "vloop.graph.v1"
     metadata: Mapping[str, str] = field(default_factory=dict)
+    joins: tuple[GraphJoin, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.graph_id.strip() or self.schema_version < 1:
@@ -126,14 +189,31 @@ class GraphManifest:
                         "budget": node.budget,
                         "timeout_seconds": node.timeout_seconds,
                         "required_guards": node.required_guards,
+                        "input_ports": [
+                            {"name": port.name, "direction": port.direction.value, "schema_digest": port.schema_digest,
+                             "required": port.required}
+                            for port in node.input_ports
+                        ],
+                        "output_ports": [
+                            {"name": port.name, "direction": port.direction.value, "schema_digest": port.schema_digest,
+                             "required": port.required}
+                            for port in node.output_ports
+                        ],
                         "metadata": dict(node.metadata),
                     }
                     for node in self.nodes
                 ],
                 "edges": [
                     {"source": edge.source, "target": edge.target, "edge_type": edge.edge_type.value,
-                     "condition": edge.condition}
+                     "condition": edge.condition, "source_port": edge.source_port, "target_port": edge.target_port,
+                     "predicate": {"kind": edge.predicate.kind.value, "field": edge.predicate.field,
+                                   "value": edge.predicate.value, "values": edge.predicate.values}}
                     for edge in self.edges
+                ],
+                "joins": [
+                    {"node_id": join.node_id, "predecessors": join.predecessors, "policy": join.policy.value,
+                     "threshold": join.threshold}
+                    for join in self.joins
                 ],
             }
         )
@@ -147,6 +227,22 @@ class GraphManifest:
         for edge in self.edges:
             if edge.source not in node_ids or edge.target not in node_ids:
                 errors.append(f"edge {edge.source}->{edge.target} refers to an unknown node")
+                continue
+            source = by_id[edge.source]
+            target = by_id[edge.target]
+            if not _edge_pair_is_valid(source.node_type, edge.edge_type, target.node_type):
+                errors.append(
+                    f"edge {edge.edge_type.value} is invalid for {source.node_type.value}->{target.node_type.value}"
+                )
+            if edge.source_port:
+                source_ports = {port.name: port for port in source.output_ports}
+                target_ports = {port.name: port for port in target.input_ports}
+                source_port = source_ports.get(edge.source_port)
+                target_port = target_ports.get(edge.target_port)
+                if source_port is None or target_port is None:
+                    errors.append(f"edge {edge.source}->{edge.target} names an unknown port")
+                elif source_port.schema_digest != target_port.schema_digest:
+                    errors.append(f"edge {edge.source}->{edge.target} joins incompatible port schemas")
         incoming: dict[str, list[GraphEdge]] = {node_id: [] for node_id in node_ids}
         outgoing: dict[str, list[GraphEdge]] = {node_id: [] for node_id in node_ids}
         for edge in self.edges:
@@ -170,7 +266,8 @@ class GraphManifest:
                 errors.append(f"reachable node {node.node_id!r} has no successor or terminal declaration")
         for node in self.nodes:
             if node.effect == "side-effect" and not any(
-                edge.edge_type is GraphEdgeType.AUTHORISED_BY for edge in incoming[node.node_id]
+                edge.edge_type in {GraphEdgeType.AUTHORISED_BY, GraphEdgeType.DISPATCHED_TO}
+                for edge in incoming[node.node_id]
             ):
                 errors.append(f"side-effect node {node.node_id!r} has no authority edge")
             if node.effect == "side-effect" and not self._has_capability_path(node.node_id, incoming, by_id):
@@ -189,18 +286,31 @@ class GraphManifest:
                 if not node.required_guards:
                     errors.append("accept decision has no completion requirements")
                 else:
-                    guard_nodes = {
-                        edge.source
-                        for edge in incoming[node.node_id]
-                        if edge.edge_type is GraphEdgeType.SATISFIES
-                        and by_id[edge.source].node_type is GraphNodeType.CRITERION
-                    }
+                    barrier_edges = [
+                        edge for edge in incoming[node.node_id]
+                        if edge.edge_type is GraphEdgeType.SATISFIES and by_id[edge.source].node_type is GraphNodeType.JOIN
+                    ]
+                    if len(barrier_edges) != 1:
+                        errors.append("accept decision needs exactly one explicit guard join")
+                        continue
+                    join = next((candidate for candidate in self.joins if candidate.node_id == barrier_edges[0].source), None)
+                    if join is None or join.policy is not JoinPolicy.ALL:
+                        errors.append("accept decision requires an ALL guard join")
+                        continue
+                    guard_nodes = set(join.predecessors)
                     actual_guards = {by_id[node_id].metadata.get("guard", "") for node_id in guard_nodes}
                     missing = set(node.required_guards).difference(actual_guards)
                     if missing:
                         errors.append(f"accept decision lacks criterion edges for: {sorted(missing)}")
                     if self._reachable_without(entries, node.node_id, guard_nodes, outgoing):
                         errors.append("accept decision is reachable without completion criteria")
+        for join in self.joins:
+            if join.node_id not in by_id or by_id[join.node_id].node_type is not GraphNodeType.JOIN:
+                errors.append(f"join {join.node_id!r} does not name a join node")
+                continue
+            join_inputs = {edge.source for edge in incoming[join.node_id] if edge.edge_type is GraphEdgeType.SATISFIES}
+            if join_inputs != set(join.predecessors):
+                errors.append(f"join {join.node_id!r} does not have its declared predecessor edges")
         for component in self._cyclic_components(outgoing):
             component_nodes = [by_id[node_id] for node_id in component]
             has_budget = all(node.budget is not None for node in component_nodes)
@@ -264,7 +374,11 @@ class GraphManifest:
             seen.add(node_id)
             if node_id != start and by_id[node_id].node_type is GraphNodeType.CAPABILITY:
                 return True
-            pending.extend(edge.source for edge in incoming[node_id] if edge.edge_type is GraphEdgeType.AUTHORISED_BY)
+            pending.extend(
+                edge.source
+                for edge in incoming[node_id]
+                if edge.edge_type in {GraphEdgeType.AUTHORISED_BY, GraphEdgeType.DISPATCHED_TO}
+            )
         return False
 
     @staticmethod
@@ -385,13 +499,135 @@ class GraphManifest:
         return tuple(components)
 
 
+@dataclass(frozen=True, slots=True)
+class GraphCompiler:
+    """Compiler-owned authority boundary from a task contract to executable law.
+
+    Planners never construct the production control graph.  They may later
+    select an admitted read-only subgraph, but this compiler owns every
+    authority, effect, reconciliation, evaluator, and acceptance transition.
+    """
+
+    compiler_version: str = "vloop.graph.v2"
+
+    def compile(self, contract: TaskContract) -> GraphManifest:
+        return replace(_compile_control_graph(contract), compiler_version=self.compiler_version)
+
+
 def compile_control_graph(contract: TaskContract) -> GraphManifest:
+    """Compatibility entrypoint for the deployment-owned graph compiler."""
+
+    return GraphCompiler().compile(contract)
+
+
+def _compile_control_graph(contract: TaskContract) -> GraphManifest:
     """Compile V-Loop's fixed authority/control skeleton into a typed graph."""
 
     guards = contract.global_completion_guards or contract.success_conditions
+    contract_schema = schema_digest("TaskContract.v1")
+    principal_schema = schema_digest("PrincipalAuthority.v1")
+    intent_schema = schema_digest("ActionIntent.v1")
+    capability_schema = schema_digest("Capability.v1")
+    operation_schema = schema_digest("PreparedOperation.v1")
+    artifact_schema = schema_digest("ArtifactManifest.v2")
+    snapshot_schema = schema_digest("WorkspaceSnapshot.v1")
+    receipt_schema = schema_digest("SignedEvaluationReceipt.v2")
+    guard_schema = schema_digest("VerifiedGuard.v1")
+    barrier_schema = schema_digest("AllGuardsBarrier.v1")
+    evaluation_schema = schema_digest("ProtectedEvaluationResult.v1")
+
+    def input_port(name: str, schema: str) -> NodePort:
+        return NodePort(name, PortDirection.INPUT, schema)
+
+    def output_port(name: str, schema: str) -> NodePort:
+        return NodePort(name, PortDirection.OUTPUT, schema)
+
+    def node_token(value: str) -> str:
+        return "".join(character if character.isalnum() else "-" for character in value).strip("-") or "unnamed"
+
+    verifier_names = tuple(
+        dict.fromkeys(
+            name
+            for names in contract.required_verifiers.values()
+            for name in names
+        )
+    )
+    receipt_names = tuple(dict.fromkeys((*verifier_names, *guards)))
+    action_rules = tuple(
+        GraphNode(
+            f"action.rule.{index}",
+            GraphNodeType.ACTION,
+            metadata={
+                "rule_index": str(index),
+                "tool": rule.tool,
+                "effect": rule.effect.value,
+                "target_prefix": rule.target_prefix,
+                "requires_approval": str(rule.approval_required).lower(),
+            },
+            input_ports=(input_port("intent", intent_schema),),
+            output_ports=(output_port("matched_intent", intent_schema),),
+        )
+        for index, rule in enumerate(contract.allowed_actions)
+    )
+    approval_nodes = tuple(
+        GraphNode(
+            f"approval.rule.{index}",
+            GraphNodeType.APPROVAL,
+            authority="human-review",
+            metadata={"rule_index": str(index)},
+            input_ports=(input_port("intent", intent_schema),),
+            output_ports=(output_port("approved_intent", intent_schema),),
+        )
+        for index, rule in enumerate(contract.allowed_actions)
+        if rule.approval_required
+    )
+    authorisation_predecessors = tuple(
+        node.node_id for node in action_rules if node.metadata["requires_approval"] == "false"
+    ) + tuple(node.node_id for node in approval_nodes)
+    if not authorisation_predecessors:  # defensive: TaskContract always has actions
+        raise ValueError("control graph needs an action authorization path")
+    action_join = GraphNode(
+        "join.action.authority.any",
+        GraphNodeType.JOIN,
+        input_ports=tuple(input_port(f"intent.{index}", intent_schema) for index, _ in enumerate(authorisation_predecessors)),
+        output_ports=(output_port("authorised_intent", intent_schema),),
+    )
+    evaluator_nodes = tuple(
+        GraphNode(
+            f"evaluator.{node_token(name)}",
+            GraphNodeType.EVALUATOR,
+            metadata={"check_name": name},
+            input_ports=(input_port("evaluation", evaluation_schema),),
+            output_ports=(output_port("receipt", receipt_schema),),
+        )
+        for name in receipt_names
+    )
+    receipt_nodes = tuple(
+        GraphNode(
+            f"receipt.{node_token(name)}",
+            GraphNodeType.RECEIPT,
+            metadata={"receipt_type": name, "terminal": "true"},
+            input_ports=(input_port("receipt", receipt_schema),),
+            output_ports=(output_port("verified", receipt_schema),),
+        )
+        for name in receipt_names
+    )
+
     criteria = tuple(
-        GraphNode(f"criterion.{index}", GraphNodeType.CRITERION, metadata={"guard": guard})
+        GraphNode(
+            f"criterion.{index}",
+            GraphNodeType.CRITERION,
+            metadata={"guard": guard},
+            input_ports=(input_port("receipt", receipt_schema),),
+            output_ports=(output_port("guard", guard_schema),),
+        )
         for index, guard in enumerate(guards)
+    )
+    guard_join = GraphNode(
+        "join.guards.all",
+        GraphNodeType.JOIN,
+        input_ports=tuple(input_port(f"guard.{index}", guard_schema) for index in range(len(criteria))),
+        output_ports=(output_port("barrier", barrier_schema),),
     )
     graph = GraphManifest(
         graph_id="vloop-control",
@@ -399,48 +635,114 @@ def compile_control_graph(contract: TaskContract) -> GraphManifest:
         contract_digest=contract.contract_digest,
         profile_digest=contract.profile_digest or "0" * 64,
         nodes=(
-            GraphNode("task.contract", GraphNodeType.TASK),
-            GraphNode("principal.contract", GraphNodeType.PRINCIPAL, authority="1"),
-            GraphNode("action.intent", GraphNodeType.ACTION),
-            GraphNode("capability.execute", GraphNodeType.CAPABILITY, authority="policy-gate"),
-            GraphNode("operation.prepared", GraphNodeType.OPERATION),
-            GraphNode("executor.effect", GraphNodeType.EXECUTOR, effect="side-effect", authority="capability.execute"),
+            GraphNode("task.contract", GraphNodeType.TASK, output_ports=(output_port("contract", contract_schema),)),
+            GraphNode(
+                "principal.contract", GraphNodeType.PRINCIPAL, authority="1",
+                input_ports=(input_port("contract", contract_schema),),
+                output_ports=(output_port("authority", principal_schema),),
+            ),
+            GraphNode(
+                "action.intent", GraphNodeType.ACTION,
+                input_ports=(input_port("contract", contract_schema),), output_ports=(output_port("intent", intent_schema),),
+            ),
+            *action_rules,
+            *approval_nodes,
+            action_join,
+            GraphNode(
+                "capability.execute", GraphNodeType.CAPABILITY, authority="policy-gate",
+                input_ports=(input_port("intent", intent_schema), input_port("authority", principal_schema)),
+                output_ports=(output_port("capability", capability_schema),),
+            ),
+            GraphNode(
+                "operation.prepared", GraphNodeType.OPERATION,
+                input_ports=(input_port("capability", capability_schema),), output_ports=(output_port("operation", operation_schema),),
+            ),
+            GraphNode(
+                "executor.effect", GraphNodeType.EXECUTOR, effect="side-effect", authority="capability.execute",
+                input_ports=(input_port("operation", operation_schema),), output_ports=(output_port("artifacts", artifact_schema),),
+            ),
             GraphNode("operation.reconcile", GraphNodeType.OPERATION, metadata={"recovery": "true"}),
-            GraphNode("snapshot.workspace", GraphNodeType.SNAPSHOT),
-            GraphNode("artifact.manifest", GraphNodeType.ARTIFACT),
-            GraphNode("evaluator.protected", GraphNodeType.EVALUATOR),
-            GraphNode("receipt.evidence", GraphNodeType.RECEIPT),
+            GraphNode(
+                "snapshot.workspace", GraphNodeType.SNAPSHOT,
+                input_ports=(input_port("contract", contract_schema),), output_ports=(output_port("snapshot", snapshot_schema),),
+            ),
+            GraphNode("artifact.manifest", GraphNodeType.ARTIFACT, input_ports=(input_port("artifacts", artifact_schema),), output_ports=(output_port("manifest", artifact_schema),)),
+            GraphNode(
+                "evaluator.protected", GraphNodeType.EVALUATOR,
+                input_ports=(input_port("artifact", artifact_schema), input_port("snapshot", snapshot_schema)),
+                output_ports=(output_port("evaluation", evaluation_schema),),
+            ),
+            *evaluator_nodes,
+            *receipt_nodes,
+            guard_join,
             GraphNode(
                 "decision.accept",
                 GraphNodeType.DECISION,
                 effect="terminal",
                 required_guards=guards,
+                input_ports=(input_port("barrier", barrier_schema),),
             ),
             GraphNode("decision.escalate", GraphNodeType.DECISION, effect="terminal"),
             *criteria,
         ),
         edges=(
-            GraphEdge("task.contract", "principal.contract", GraphEdgeType.DEPENDS_ON),
-            GraphEdge("task.contract", "action.intent", GraphEdgeType.DEPENDS_ON),
-            GraphEdge("principal.contract", "capability.execute", GraphEdgeType.AUTHORISED_BY),
-            GraphEdge("action.intent", "capability.execute", GraphEdgeType.DEPENDS_ON),
-            GraphEdge("capability.execute", "operation.prepared", GraphEdgeType.AUTHORISED_BY),
-            GraphEdge("operation.prepared", "executor.effect", GraphEdgeType.AUTHORISED_BY),
-            GraphEdge("task.contract", "snapshot.workspace", GraphEdgeType.DEPENDS_ON),
-            GraphEdge("executor.effect", "artifact.manifest", GraphEdgeType.PRODUCED, "execution.success"),
-            GraphEdge("artifact.manifest", "evaluator.protected", GraphEdgeType.VERIFIED_BY, "execution.success"),
-            GraphEdge("snapshot.workspace", "evaluator.protected", GraphEdgeType.REQUIRES),
+            GraphEdge("task.contract", "principal.contract", GraphEdgeType.DEPENDS_ON, source_port="contract", target_port="contract"),
+            GraphEdge("task.contract", "action.intent", GraphEdgeType.DEPENDS_ON, source_port="contract", target_port="contract"),
+            GraphEdge("principal.contract", "capability.execute", GraphEdgeType.AUTHORISED_BY, source_port="authority", target_port="authority"),
+            *tuple(
+                GraphEdge(
+                    "action.intent", action_rule.node_id, GraphEdgeType.DEPENDS_ON,
+                    source_port="intent", target_port="intent",
+                    predicate=GraphPredicate(PredicateKind.FIELD_EQUALS, "rule_index", action_rule.metadata["rule_index"]),
+                )
+                for action_rule in action_rules
+            ),
+            *tuple(
+                GraphEdge(action_rule.node_id, f"approval.rule.{action_rule.metadata['rule_index']}", GraphEdgeType.AUTHORISED_BY, source_port="matched_intent", target_port="intent")
+                for action_rule in action_rules
+                if action_rule.metadata["requires_approval"] == "true"
+            ),
+            *tuple(
+                GraphEdge(
+                    source_node_id, action_join.node_id, GraphEdgeType.SATISFIES,
+                    source_port="matched_intent" if source_node_id.startswith("action.rule.") else "approved_intent",
+                    target_port=f"intent.{index}",
+                )
+                for index, source_node_id in enumerate(authorisation_predecessors)
+            ),
+            GraphEdge(action_join.node_id, "capability.execute", GraphEdgeType.SATISFIES, source_port="authorised_intent", target_port="intent"),
+            GraphEdge("capability.execute", "operation.prepared", GraphEdgeType.AUTHORISED_BY, source_port="capability", target_port="capability"),
+            GraphEdge("operation.prepared", "executor.effect", GraphEdgeType.DISPATCHED_TO, source_port="operation", target_port="operation"),
+            GraphEdge("task.contract", "snapshot.workspace", GraphEdgeType.DEPENDS_ON, source_port="contract", target_port="contract"),
+            GraphEdge("executor.effect", "artifact.manifest", GraphEdgeType.PRODUCED, "execution.success", "artifacts", "artifacts"),
+            GraphEdge("artifact.manifest", "evaluator.protected", GraphEdgeType.VERIFIED_BY, "execution.success", "manifest", "artifact"),
+            GraphEdge("snapshot.workspace", "evaluator.protected", GraphEdgeType.REQUIRES, source_port="snapshot", target_port="snapshot"),
             GraphEdge("executor.effect", "operation.reconcile", GraphEdgeType.RECONCILES, "outcome-unknown-or-failed"),
             GraphEdge("operation.reconcile", "decision.escalate", GraphEdgeType.ESCALATES_TO),
-            GraphEdge("evaluator.protected", "receipt.evidence", GraphEdgeType.PRODUCED),
             *tuple(
-                GraphEdge("receipt.evidence", criterion.node_id, GraphEdgeType.VERIFIED_BY)
+                GraphEdge("evaluator.protected", evaluator.node_id, GraphEdgeType.DEPENDS_ON, source_port="evaluation", target_port="evaluation")
+                for evaluator in evaluator_nodes
+            ),
+            *tuple(
+                GraphEdge(evaluator.node_id, receipt.node_id, GraphEdgeType.PRODUCED, source_port="receipt", target_port="receipt")
+                for evaluator, receipt in zip(evaluator_nodes, receipt_nodes, strict=True)
+            ),
+            *tuple(
+                GraphEdge(
+                    f"receipt.{node_token(criterion.metadata['guard'])}", criterion.node_id,
+                    GraphEdgeType.VERIFIED_BY, source_port="verified", target_port="receipt"
+                )
                 for criterion in criteria
             ),
             *tuple(
-                GraphEdge(criterion.node_id, "decision.accept", GraphEdgeType.SATISFIES, "guard-pass")
-                for criterion in criteria
+                GraphEdge(criterion.node_id, guard_join.node_id, GraphEdgeType.SATISFIES, "guard-pass", "guard", f"guard.{index}")
+                for index, criterion in enumerate(criteria)
             ),
+            GraphEdge(guard_join.node_id, "decision.accept", GraphEdgeType.SATISFIES, source_port="barrier", target_port="barrier"),
+        ),
+        joins=(
+            GraphJoin(action_join.node_id, authorisation_predecessors, JoinPolicy.ANY),
+            GraphJoin(guard_join.node_id, tuple(criterion.node_id for criterion in criteria), JoinPolicy.ALL),
         ),
     )
     graph.validate().require_valid()
@@ -531,9 +833,12 @@ class DynamicSubgraphPolicy:
     )
     maximum_nodes: int = 24
     maximum_edges: int = 48
+    maximum_total_tokens: int = 32_000
+    maximum_parallelism: int = 4
+    implementations: Mapping[str, NodeImplementation] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.maximum_nodes < 1 or self.maximum_edges < 0:
+        if min(self.maximum_nodes, self.maximum_total_tokens, self.maximum_parallelism) < 1 or self.maximum_edges < 0:
             raise ValueError("dynamic graph limits are invalid")
 
     def admit(self, graph: GraphManifest, *, contract: TaskContract) -> GraphManifest:
@@ -546,9 +851,40 @@ class DynamicSubgraphPolicy:
             raise PermissionError("dynamic graph exceeds server-owned size limits")
         if graph.metadata.get("mode") != "read-only-reasoning":
             raise PermissionError("dynamic graph is not labelled read-only reasoning")
+        try:
+            requested_parallelism = int(graph.metadata.get("maximum_parallelism", "1"))
+        except ValueError as exc:
+            raise PermissionError("dynamic graph has an invalid parallelism limit") from exc
+        if requested_parallelism < 1 or requested_parallelism > self.maximum_parallelism:
+            raise PermissionError("dynamic graph exceeds server-owned parallelism limit")
+        total_tokens = 0
         for node in graph.nodes:
             if node.node_type not in self.allowed_node_types or node.effect != "read-only" or node.authority:
                 raise PermissionError(f"dynamic graph node {node.node_id!r} exceeds read-only authority")
+            if node.node_type is GraphNodeType.TASK:
+                continue
+            implementation_id = node.metadata.get("implementation_id", "")
+            implementation = self.implementations.get(implementation_id)
+            if implementation is None or node.metadata.get("implementation_digest") != implementation.implementation_digest:
+                raise PermissionError(f"dynamic node {node.node_id!r} lacks an approved implementation digest")
+            if node.budget is None or node.timeout_seconds is None:
+                raise PermissionError(f"dynamic node {node.node_id!r} lacks call or timeout budget")
+            try:
+                token_budget = int(node.metadata.get("maximum_tokens", "0"))
+            except ValueError as exc:
+                raise PermissionError(f"dynamic node {node.node_id!r} has an invalid token budget") from exc
+            if token_budget < 1 or token_budget > implementation.maximum_tokens or node.budget > implementation.maximum_calls or node.timeout_seconds > implementation.timeout_seconds:
+                raise PermissionError(f"dynamic node {node.node_id!r} exceeds its implementation budget")
+            if any(key in node.metadata for key in ("credential", "secret", "network")) or implementation.network_allowed:
+                raise PermissionError(f"dynamic node {node.node_id!r} requests credentials or network access")
+            if not node.input_ports and not node.output_ports:
+                raise PermissionError(f"dynamic node {node.node_id!r} lacks typed ports")
+            schemas = {port.schema_digest for port in node.input_ports + node.output_ports}
+            if not schemas.issubset(set(implementation.input_schema_digests + implementation.output_schema_digests)):
+                raise PermissionError(f"dynamic node {node.node_id!r} uses schemas outside its implementation")
+            total_tokens += token_budget
+        if total_tokens > self.maximum_total_tokens:
+            raise PermissionError("dynamic graph exceeds server-owned total token budget")
         if any(edge.edge_type not in self.allowed_edge_types for edge in graph.edges):
             raise PermissionError("dynamic graph contains a non-approved edge type")
         if GraphManifest._cyclic_components(

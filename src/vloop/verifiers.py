@@ -272,6 +272,11 @@ class SignedReceiptVerifier:
                 contract_digest=contract.contract_digest,
                 graph_digest=_metadata_string(observation.metadata, "receipt_graph_digest"),
                 graph_node_id=_metadata_string(observation.metadata, "receipt_graph_node_id"),
+                graph_node_instance_id=(
+                    _metadata_string(observation.metadata, "receipt_graph_node_instance_id")
+                    if _metadata_string(observation.metadata, "receipt_graph_node_instance_id")
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError, ReceiptRejected) as exc:
             return CheckResult(

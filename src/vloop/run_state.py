@@ -129,6 +129,7 @@ class SQLiteRunStateStore:
 
     def __init__(self, database: str | Path) -> None:
         path = Path(database)
+        self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(path, isolation_level=None, timeout=5.0)
         self._connection.execute("PRAGMA busy_timeout=5000")
