@@ -14,6 +14,38 @@ model outside the trusted computing base:
 The controller may propose an action, but only the deterministic policy gate
 can authorize it and only independently recorded evidence can satisfy a task.
 
+## Graph runtime and harness evolution
+
+The compiled control graph makes the production route inspectable rather than
+implicit in controller branches:
+
+```text
+task + principal → action → capability → prepared operation → executor
+      │                                                   ├→ reconciliation → escalation
+      └→ immutable workspace snapshot                     └→ artifact manifest
+                                                              ↓
+snapshot + artifact → protected evaluator → signed receipt → criteria → accept
+```
+
+`compile_control_graph(contract)` returns an immutable `GraphManifest` and
+its SHA-256 `graph_digest`. `VerifiedLoop` persists that digest in the run
+checkpoint, binds it to the capability and prepared operation, transmits it to
+the Firecracker supervisor and protected evaluator, and requires the signed
+receipt to name the expected evaluator graph node. An otherwise valid receipt
+from another graph or node is rejected.
+
+`DynamicSubgraphPolicy` admits only contract-bound read-only analysis graphs
+composed of approved node and edge types. It rejects cycles and any
+authority-bearing node, so dynamic planning can remove work but cannot add
+authority.
+
+`HarnessRegistry` is the controlled path for changing context, tool, routing,
+probe, evaluator, memory, or repair components. A proposal stores its predicted
+metric, expected failure mode, affected task classes, immutable baseline, and
+minimum improvement. It needs held-out shadow evidence, an independent
+reviewer to promote it, and a second independent reviewer to roll it back;
+rollback refuses to overwrite a newer version.
+
 ## What is implemented
 
 - versioned task contracts and per-action budgets;
@@ -54,6 +86,16 @@ can authorize it and only independently recorded evidence can satisfy a task.
   that requires an external reviewer;
 - optional OpenAI-compatible planner wiring for the configured BazaarLink
   endpoint and DeepSeek model.
+- a deterministic typed Graph IR that compiles control, authority,
+  snapshot/artifact, evaluator, receipt, criterion, recovery, and decision
+  paths, with graph-digest binding for runs, capabilities, prepared operations,
+  supervisor execution specifications, and protected evaluator receipts;
+- static graph checks for reachability, dead ends, capability and approval
+  paths, guard dominance, bounded cycle exit, recovery coverage, untrusted
+  provenance influence, memory-authority monotonicity, and human-control exits;
+- server-owned admission for bounded, acyclic, read-only dynamic reasoning
+  subgraphs, plus durable governed harness evolution and model-controlled
+  topology benchmark summaries.
 
 ## Safety boundary
 

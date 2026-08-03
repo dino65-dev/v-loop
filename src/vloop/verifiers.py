@@ -8,6 +8,13 @@ from .models import ActionIntent, CheckResult, CheckStatus, ExecutionObservation
 from .receipts import EvaluationReceipt, ReceiptRejected, ReceiptVerifier
 
 
+def _metadata_string(metadata: Mapping[str, object], name: str) -> str | None:
+    """Return an optional immutable binding only when the metadata is well formed."""
+
+    value = metadata.get(name)
+    return value if isinstance(value, str) and value else None
+
+
 class Verifier(Protocol):
     def verify(self, contract: TaskContract, observation: ExecutionObservation) -> CheckResult: ...
 
@@ -263,6 +270,8 @@ class SignedReceiptVerifier:
                 intent_digest=intent.intent_digest,
                 artifact_digests=observation.artifact_digests,
                 contract_digest=contract.contract_digest,
+                graph_digest=_metadata_string(observation.metadata, "receipt_graph_digest"),
+                graph_node_id=_metadata_string(observation.metadata, "receipt_graph_node_id"),
             )
         except (KeyError, TypeError, ValueError, ReceiptRejected) as exc:
             return CheckResult(

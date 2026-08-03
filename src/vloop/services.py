@@ -174,6 +174,8 @@ class FirecrackerSupervisorHTTPClient:
             {
                 "operation_id": prepared_execution.operation_id,
                 "execution_spec_digest": prepared_execution.request_digest,
+                "graph_digest": prepared_execution.graph_digest,
+                "graph_node_id": prepared_execution.graph_node_id,
             },
             idempotency_key=prepared_execution.operation_id,
         )
@@ -241,7 +243,11 @@ class ProtectedEvaluatorHTTPClient:
         workspace_snapshot_digest: str,
         evaluator_image_digest: str,
         test_suite_digest: str,
+        graph_digest: str = "",
+        graph_node_id: str = "",
     ) -> Mapping[str, Any]:
+        if bool(graph_digest) != bool(graph_node_id):
+            raise ValueError("protected evaluation graph digest and node must be supplied together")
         payload = {
             "run_id": run_id,
             "contract_digest": contract_digest,
@@ -251,11 +257,13 @@ class ProtectedEvaluatorHTTPClient:
             "workspace_snapshot_digest": workspace_snapshot_digest,
             "evaluator_image_digest": evaluator_image_digest,
             "test_suite_digest": test_suite_digest,
+            "graph_digest": graph_digest,
+            "graph_node_id": graph_node_id,
         }
         response = self.client.post(
             self.endpoint,
             payload,
-            idempotency_key=digest({"run_id": run_id, "intent_digest": intent_digest, "receipt_type": receipt_type}),
+            idempotency_key=digest({"run_id": run_id, "intent_digest": intent_digest, "receipt_type": receipt_type, "graph_digest": graph_digest, "graph_node_id": graph_node_id}),
         )
         receipt = response.get("receipt")
         if not isinstance(receipt, Mapping):

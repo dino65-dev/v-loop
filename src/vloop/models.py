@@ -67,6 +67,8 @@ class PreparedExecution:
     intent_digest: str
     request_digest: str
     remote_job_id: str
+    graph_digest: str = ""
+    graph_node_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.operation_id.strip() or not self.executor_id.strip() or not self.remote_job_id.strip():
@@ -74,6 +76,13 @@ class PreparedExecution:
         for label, value in (("intent", self.intent_digest), ("request", self.request_digest)):
             if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
                 raise ValueError(f"prepared execution {label} digest must be SHA-256 hex")
+        if bool(self.graph_digest) != bool(self.graph_node_id):
+            raise ValueError("prepared execution graph digest and node must be supplied together")
+        if self.graph_digest and (
+            len(self.graph_digest) != 64
+            or any(character not in "0123456789abcdef" for character in self.graph_digest)
+        ):
+            raise ValueError("prepared execution graph digest must be SHA-256 hex")
 
 
 @dataclass(frozen=True, slots=True)

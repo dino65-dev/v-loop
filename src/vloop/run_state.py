@@ -98,6 +98,11 @@ class RunCheckpoint:
                 raise ValueError("prepared execution belongs to another executor")
             if self.pending_intent is not None and self.prepared_execution.intent_digest != self.pending_intent.intent_digest:
                 raise ValueError("prepared execution belongs to another intent")
+            if self.graph_digest and (
+                self.prepared_execution.graph_digest != self.graph_digest
+                or self.prepared_execution.graph_node_id != "operation.prepared"
+            ):
+                raise ValueError("prepared execution is not bound to this checkpoint graph")
         elif self.prepared_execution is not None:
             raise ValueError("only effect checkpoints may retain a prepared operation")
         if self.phase not in pending_phases and (self.pending_intent is not None or self.executor_id):
@@ -412,6 +417,8 @@ def _encode_prepared_execution(prepared: PreparedExecution) -> dict[str, str]:
         "intent_digest": prepared.intent_digest,
         "request_digest": prepared.request_digest,
         "remote_job_id": prepared.remote_job_id,
+        "graph_digest": prepared.graph_digest,
+        "graph_node_id": prepared.graph_node_id,
     }
 
 
@@ -422,6 +429,8 @@ def _decode_prepared_execution(value: Mapping[str, Any]) -> PreparedExecution:
         intent_digest=str(value["intent_digest"]),
         request_digest=str(value["request_digest"]),
         remote_job_id=str(value["remote_job_id"]),
+        graph_digest=str(value.get("graph_digest", "")),
+        graph_node_id=str(value.get("graph_node_id", "")),
     )
 
 

@@ -147,6 +147,8 @@ class VerifiedLoop:
                         "executor_id": self._checkpoint.executor_id,
                         "operation_id": prepared_execution.operation_id,
                         "request_digest": prepared_execution.request_digest,
+                        "graph_digest": prepared_execution.graph_digest,
+                        "graph_node_id": prepared_execution.graph_node_id,
                         "success": observation.success,
                         "exit_code": observation.exit_code,
                         "artifact_digests": dict(observation.artifact_digests),
@@ -212,6 +214,8 @@ class VerifiedLoop:
                         "operation_id": prepared_execution.operation_id,
                         "remote_job_id": prepared_execution.remote_job_id,
                         "request_digest": prepared_execution.request_digest,
+                        "graph_digest": prepared_execution.graph_digest,
+                        "graph_node_id": prepared_execution.graph_node_id,
                     },
                 )
                 binder = getattr(self.executor, "bind_run", None)
@@ -234,6 +238,8 @@ class VerifiedLoop:
                         "graph_node_id": capability.graph_node_id,
                         "operation_id": prepared_execution.operation_id,
                         "request_digest": prepared_execution.request_digest,
+                        "prepared_graph_digest": prepared_execution.graph_digest,
+                        "prepared_graph_node_id": prepared_execution.graph_node_id,
                         "success": observation.success,
                         "exit_code": observation.exit_code,
                         "artifact_digests": dict(observation.artifact_digests),
@@ -247,6 +253,8 @@ class VerifiedLoop:
                         contract=self.contract,
                         intent=intent,
                         observation=observation,
+                        graph_digest=self.graph_digest,
+                        graph_node_id="evaluator.protected",
                     )
                     existing_receipts = observation.metadata.get("evaluator_receipts", {})
                     merged_receipts = (
@@ -261,6 +269,8 @@ class VerifiedLoop:
                             "workspace_snapshot_digest": bundle.workspace_snapshot.workspace_snapshot_digest,
                             "workspace_snapshot_schema": bundle.workspace_snapshot.schema_version,
                             "workspace_exclusion_policy_digest": bundle.workspace_snapshot.exclusion_policy_digest,
+                            "receipt_graph_digest": self.graph_digest,
+                            "receipt_graph_node_id": "evaluator.protected",
                         },
                     )
                     self.ledger.append(
@@ -270,6 +280,8 @@ class VerifiedLoop:
                             "intent_digest": intent.intent_digest,
                             "workspace_snapshot_digest": bundle.workspace_snapshot.workspace_snapshot_digest,
                             "receipt_types": sorted(bundle.evaluator_receipts),
+                            "graph_digest": self.graph_digest,
+                            "graph_node_id": "evaluator.protected",
                         },
                     )
                 except Exception as exc:
@@ -609,6 +621,8 @@ class VerifiedLoop:
                 contract_digest=self.contract.contract_digest,
                 iteration=iteration,
                 operation_id=operation_id,
+                graph_digest=self.graph_digest,
+                graph_node_id="operation.prepared",
             )
             if not isinstance(prepared, PreparedExecution):
                 raise TypeError("executor returned an invalid prepared execution")
@@ -624,14 +638,20 @@ class VerifiedLoop:
                         "contract_digest": self.contract.contract_digest,
                         "iteration": iteration,
                         "intent_digest": intent.intent_digest,
+                        "graph_digest": self.graph_digest,
+                        "graph_node_id": "operation.prepared",
                     }
                 ),
                 remote_job_id=operation_id,
+                graph_digest=self.graph_digest,
+                graph_node_id="operation.prepared",
             )
         if (
             prepared.operation_id != operation_id
             or prepared.executor_id != self.executor.executor_id
             or prepared.intent_digest != intent.intent_digest
+            or prepared.graph_digest != self.graph_digest
+            or prepared.graph_node_id != "operation.prepared"
         ):
             raise ValueError("prepared execution does not bind this operation")
         return prepared
@@ -705,6 +725,8 @@ class VerifiedLoop:
         if (
             observation.metadata.get("operation_id") != prepared_execution.operation_id
             or observation.metadata.get("request_digest") != prepared_execution.request_digest
+            or observation.metadata.get("graph_digest") != prepared_execution.graph_digest
+            or observation.metadata.get("graph_node_id") != prepared_execution.graph_node_id
         ):
             raise PermissionError("reconciliation observation is not bound to the prepared operation")
         self._checkpoint = checkpoint

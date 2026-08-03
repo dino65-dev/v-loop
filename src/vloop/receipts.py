@@ -316,12 +316,24 @@ class ReceiptSigner:
         workspace_snapshot: Any | None = None,
         revocation_epoch: int = 0,
         claims: Mapping[str, Any] | None = None,
+        graph_digest: str = "",
+        graph_node_id: str = "",
         ttl: timedelta = timedelta(minutes=10),
         now: datetime | None = None,
         schema_version: int = 2,
     ) -> EvaluationReceipt:
         issued_at = now or datetime.now(UTC)
         claims_payload = dict(claims or {})
+        if bool(graph_digest) != bool(graph_node_id):
+            raise ValueError("receipt graph digest and node must be supplied together")
+        if graph_digest:
+            if len(graph_digest) != 64 or any(character not in "0123456789abcdef" for character in graph_digest):
+                raise ValueError("receipt graph digest must be SHA-256 hex")
+            for name, value in (("graph_digest", graph_digest), ("graph_node_id", graph_node_id)):
+                existing = claims_payload.get(name)
+                if existing is not None and existing != value:
+                    raise ValueError(f"receipt claim {name} conflicts with graph binding")
+                claims_payload[name] = value
         if workspace_snapshot is not None:
             required_attributes = (
                 "schema_version",
@@ -431,6 +443,8 @@ class ReceiptVerifier:
         intent_digest: str,
         artifact_digests: Mapping[str, str],
         contract_digest: str | None = None,
+        graph_digest: str | None = None,
+        graph_node_id: str | None = None,
         now: datetime | None = None,
     ) -> None:
         current = now or datetime.now(UTC)
@@ -438,6 +452,13 @@ class ReceiptVerifier:
             raise ReceiptRejected("receipt type does not match verifier")
         if receipt.run_id != run_id or receipt.intent_digest != intent_digest:
             raise ReceiptRejected("receipt is not bound to this run and intent")
+        if bool(graph_digest) != bool(graph_node_id):
+            raise ValueError("expected receipt graph digest and node must be supplied together")
+        if graph_digest and (
+            receipt.claims.get("graph_digest") != graph_digest
+            or receipt.claims.get("graph_node_id") != graph_node_id
+        ):
+            raise ReceiptRejected("receipt is not bound to the expected graph node")
         if (
             receipt.expires_at <= current
             or receipt.issued_at > current + self._clock_skew

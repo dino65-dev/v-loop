@@ -286,6 +286,8 @@ class CapabilityEnforcingExecutor:
         contract_digest: str,
         iteration: int,
         operation_id: str,
+        graph_digest: str = "",
+        graph_node_id: str = "",
     ) -> PreparedExecution:
         """Prepare a durable operation identity without starting its effect."""
 
@@ -298,6 +300,8 @@ class CapabilityEnforcingExecutor:
                 iteration=iteration,
                 operation_id=operation_id,
                 executor_id=self.executor_id,
+                graph_digest=graph_digest,
+                graph_node_id=graph_node_id,
             )
             if not isinstance(prepared, PreparedExecution):
                 raise TypeError("raw executor returned an invalid prepared execution")
@@ -305,6 +309,8 @@ class CapabilityEnforcingExecutor:
                 prepared.operation_id != operation_id
                 or prepared.executor_id != self.executor_id
                 or prepared.intent_digest != intent.intent_digest
+                or prepared.graph_digest != graph_digest
+                or prepared.graph_node_id != graph_node_id
             ):
                 raise ValueError("raw executor prepared another operation")
             return prepared
@@ -323,6 +329,8 @@ class CapabilityEnforcingExecutor:
                 }
             ),
             remote_job_id=operation_id,
+            graph_digest=graph_digest,
+            graph_node_id=graph_node_id,
         )
 
     def execute(self, intent: ActionIntent, capability: Capability) -> ExecutionObservation:

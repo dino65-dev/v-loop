@@ -42,7 +42,23 @@ from vloop.firecracker import (
     GuestExecutionResult,
     MicroVMResources,
 )
-from vloop.graph import GraphManifest, GraphNode, GraphNodeType, compile_control_graph
+from vloop.graph import (
+    DynamicSubgraphPolicy,
+    GraphEdge,
+    GraphEdgeType,
+    GraphManifest,
+    GraphNode,
+    GraphNodeType,
+    compile_control_graph,
+)
+from vloop.graph_benchmark import GraphRunMetric, summarize_graph_benchmark
+from vloop.harness_evolution import (
+    HarnessChangeProposal,
+    HarnessChangeStatus,
+    HarnessComponent,
+    HarnessRegistry,
+    ShadowEvaluation,
+)
 from vloop.ledger import EvidenceLedger, LedgerAnchorWorker
 from vloop.learning import (
     EvaluationSlice,
@@ -98,7 +114,7 @@ from vloop.policy import (
     SQLiteApprovalConsumptionStore,
 )
 from vloop.probes import CallableProbe, ProbeDefinition, ProbeKind, ProtectedProbeRunner, probe_policy_digest
-from vloop.receipts import ReceiptKeyTrustEntry, ReceiptPolicy, ReceiptSigner, ReceiptVerifier
+from vloop.receipts import ReceiptKeyTrustEntry, ReceiptPolicy, ReceiptRejected, ReceiptSigner, ReceiptVerifier
 from vloop.snapshot import CanonicalWorkspaceSnapshotter, SNAPSHOT_SCHEMA, WorkspaceSnapshot
 from vloop.repair import RepairController
 from vloop.runtime import ProductionConfigurationError, ProductionRuntimeBuilder
@@ -308,12 +324,177 @@ def test_typed_graph_kernel_binds_runs_and_rejects_unauthorised_effects(tmp_path
         event["event_type"] == "execution.observed"
         and event["payload"]["graph_digest"] == loop.graph_digest
         and event["payload"]["graph_node_id"] == "capability.execute"
+        and event["payload"]["prepared_graph_digest"] == loop.graph_digest
+        and event["payload"]["prepared_graph_node_id"] == "operation.prepared"
         for event in ledger.events()
     )
     persisted = loop.state_store.load("graph-bound-run")  # type: ignore[union-attr]
     assert persisted is not None and persisted.graph_digest == loop.graph_digest
     evidence_graph = loop.evidence_graph()
     assert evidence_graph.nodes and "digraph vloop_evidence" in evidence_graph.to_dot()
+
+
+def test_dynamic_graphs_are_read_only_acyclic_and_contract_bound() -> None:
+    task = contract()
+    reasoning_graph = GraphManifest(
+        "reasoning",
+        1,
+        task.contract_digest,
+        "0" * 64,
+        (
+            GraphNode("task", GraphNodeType.TASK),
+            GraphNode("context", GraphNodeType.CONTEXT),
+            GraphNode("candidate", GraphNodeType.ACTION, metadata={"terminal": "true"}),
+        ),
+        (
+            GraphEdge("task", "context", GraphEdgeType.DEPENDS_ON),
+            GraphEdge("context", "candidate", GraphEdgeType.DERIVED_FROM),
+        ),
+        metadata={"mode": "read-only-reasoning"},
+    )
+    assert DynamicSubgraphPolicy().admit(reasoning_graph, contract=task) == reasoning_graph
+
+    authority_graph = replace(
+        reasoning_graph,
+        nodes=reasoning_graph.nodes + (GraphNode("cap", GraphNodeType.CAPABILITY, authority="policy"),),
+    )
+    with pytest.raises(PermissionError, match="exceeds read-only authority"):
+        DynamicSubgraphPolicy().admit(authority_graph, contract=task)
+
+    cycle_graph = replace(
+        reasoning_graph,
+        edges=reasoning_graph.edges + (GraphEdge("candidate", "context", GraphEdgeType.DEPENDS_ON),),
+    )
+    with pytest.raises(PermissionError, match="acyclic"):
+        DynamicSubgraphPolicy().admit(cycle_graph, contract=task)
+
+
+def test_static_graph_analysis_detects_authority_memory_and_cycle_violations() -> None:
+    task = contract()
+    authority_and_memory = GraphManifest(
+        "unsafe-authority",
+        1,
+        task.contract_digest,
+        "0" * 64,
+        (
+            GraphNode("task", GraphNodeType.TASK),
+            GraphNode("retrieval", GraphNodeType.CONTEXT, metadata={"trust": "untrusted"}),
+            GraphNode("capability", GraphNodeType.CAPABILITY, authority="policy", metadata={"terminal": "true"}),
+            GraphNode("memory-source", GraphNodeType.CONTEXT, authority="1"),
+            GraphNode("memory-claim", GraphNodeType.MEMORY, authority="2", metadata={"terminal": "true"}),
+        ),
+        (
+            GraphEdge("task", "retrieval", GraphEdgeType.DEPENDS_ON),
+            GraphEdge("retrieval", "capability", GraphEdgeType.DEPENDS_ON),
+            GraphEdge("task", "memory-source", GraphEdgeType.DEPENDS_ON),
+            GraphEdge("memory-source", "memory-claim", GraphEdgeType.DERIVED_FROM),
+        ),
+    )
+    authority_errors = authority_and_memory.validate().errors
+    assert any("untrusted node" in error for error in authority_errors)
+    assert any("exceeds its origin authority" in error for error in authority_errors)
+
+    bounded_cycle = GraphManifest(
+        "unbounded-repair",
+        1,
+        task.contract_digest,
+        "0" * 64,
+        (
+            GraphNode("task", GraphNodeType.TASK),
+            GraphNode("repair-a", GraphNodeType.ACTION, budget=1),
+            GraphNode("repair-b", GraphNodeType.ACTION, budget=1),
+            GraphNode("decision.escalate", GraphNodeType.DECISION, effect="terminal"),
+        ),
+        (
+            GraphEdge("task", "repair-a", GraphEdgeType.DEPENDS_ON),
+            GraphEdge("repair-a", "repair-b", GraphEdgeType.DEPENDS_ON),
+            GraphEdge("repair-b", "repair-a", GraphEdgeType.DEPENDS_ON),
+            GraphEdge("repair-b", "decision.escalate", GraphEdgeType.ESCALATES_TO),
+        ),
+    )
+    assert any("cycle requires a budget, timeout" in error for error in bounded_cycle.validate().errors)
+
+
+def test_harness_changes_require_immutable_shadow_threshold_and_independent_promotion(tmp_path: Path) -> None:
+    registry = HarnessRegistry(tmp_path / "harness.db")
+    baseline = HarnessComponent("prompt-router", "router", "1", {"strategy": "fixed"})
+    registry.register(baseline)
+    proposal = HarnessChangeProposal(
+        "change-1",
+        HarnessComponent("prompt-router", "router", "2", {"strategy": "scored"}),
+        baseline.component_digest,
+        "author-a",
+        "held-out accuracy",
+        0.10,
+        "retrieval misses",
+        ("code",),
+    )
+    registry.propose(proposal)
+    assert registry.record_shadow(ShadowEvaluation("change-1", 0.50, 0.58, True, 0.55)) is HarnessChangeStatus.REJECTED
+
+    proposal_two = replace(proposal, change_id="change-2")
+    registry.propose(proposal_two)
+    assert registry.record_shadow(ShadowEvaluation("change-2", 0.50, 0.65, True, 0.60)) is HarnessChangeStatus.SHADOW_PASSED
+    with pytest.raises(PermissionError, match="cannot promote"):
+        registry.promote("change-2", reviewer_id="author-a")
+    assert registry.promote("change-2", reviewer_id="reviewer-b").version == "2"
+    assert registry.status("change-2") is HarnessChangeStatus.PROMOTED
+    assert registry.rollback("change-2", reviewer_id="reviewer-c").version == "1"
+    assert registry.status("change-2") is HarnessChangeStatus.ROLLED_BACK
+
+
+def test_graph_benchmarks_report_measured_topology_tradeoffs() -> None:
+    summary = summarize_graph_benchmark(
+        (
+            GraphRunMetric("r1", "linear", True, False, False, 100, 1.0, 1, 0, 0, 4, 4, model_id="deepseek-v4-flash"),
+            GraphRunMetric("r2", "linear", False, False, True, 120, 1.4, 2, 1, 1, 4, 4, model_id="deepseek-v4-flash"),
+            GraphRunMetric("r3", "graph", True, False, False, 140, 1.2, 2, 0, 0, 8, 5, model_id="deepseek-v4-flash", parallel_efficiency=0.75),
+        )
+    )
+    assert summary["linear"].task_success_rate == 0.5
+    assert summary["linear"].false_blocking_rate == 0.5
+    assert summary["graph"].mean_critical_path_length == 5
+    assert summary["graph"].model_id == "deepseek-v4-flash"
+    assert summary["graph"].mean_parallel_efficiency == 0.75
+
+
+def test_signed_receipts_cannot_be_replayed_across_graph_nodes() -> None:
+    signer = ReceiptSigner(b"g" * 32)
+    graph_digest = "a" * 64
+    receipt = signer.issue(
+        receipt_type="protected",
+        run_id="run-1",
+        intent_digest="b" * 64,
+        candidate_artifact_digest="c" * 64,
+        evaluator_image_digest="image",
+        test_suite_digest="suite",
+        result="pass",
+        artifact_digests={"result": "c" * 64},
+        primary_artifact_name="result",
+        graph_digest=graph_digest,
+        graph_node_id="evaluator.protected",
+        schema_version=1,
+    )
+    verifier = ReceiptVerifier(signer.public_key_bytes)
+    verifier.validate(
+        receipt,
+        receipt_type="protected",
+        run_id="run-1",
+        intent_digest="b" * 64,
+        artifact_digests={"result": "c" * 64},
+        graph_digest=graph_digest,
+        graph_node_id="evaluator.protected",
+    )
+    with pytest.raises(ReceiptRejected, match="expected graph node"):
+        verifier.validate(
+            receipt,
+            receipt_type="protected",
+            run_id="run-1",
+            intent_digest="b" * 64,
+            artifact_digests={"result": "c" * 64},
+            graph_digest=graph_digest,
+            graph_node_id="receipt.evidence",
+        )
 
 
 def test_failed_execution_cannot_advance_criteria_even_if_a_verifier_is_wrong(tmp_path: Path) -> None:
@@ -2604,6 +2785,8 @@ def test_controller_persists_exact_prepared_operation_before_effect_dispatch(tmp
         loop.run()
     checkpoint = state.load(run_id)
     assert checkpoint is not None and checkpoint.prepared_execution is not None
+    assert checkpoint.prepared_execution.graph_digest == loop.graph_digest
+    assert checkpoint.prepared_execution.graph_node_id == "operation.prepared"
     assert checkpoint.prepared_execution.operation_id == digest(
         {
             "run_id": run_id,
@@ -2717,6 +2900,8 @@ def test_approval_wait_and_effect_reconciliation_are_resumable(tmp_path: Path) -
                 {
                     "operation_id": prepared.operation_id,
                     "request_digest": prepared.request_digest,
+                    "graph_digest": prepared.graph_digest,
+                    "graph_node_id": prepared.graph_node_id,
                 },
             )
 

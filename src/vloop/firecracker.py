@@ -272,7 +272,11 @@ class FirecrackerJobBuilder:
         run_id: str = "unbound",
         contract_digest: str | None = None,
         operation_id: str | None = None,
+        graph_digest: str = "",
+        graph_node_id: str = "",
     ) -> FirecrackerLaunch:
+        if bool(graph_digest) != bool(graph_node_id):
+            raise FirecrackerConfigurationError("Firecracker graph digest and node must be supplied together")
         if intent.tool != "command.run" or intent.effect is not Effect.EXECUTE:
             raise FirecrackerConfigurationError("Firecracker only executes command.run intents")
         command = intent.arguments.get("command")
@@ -302,6 +306,8 @@ class FirecrackerJobBuilder:
                 "run_id": run_id,
                 "contract_digest": contract_digest or "unbound",
                 "intent_digest": intent.intent_digest,
+                "graph_digest": graph_digest or "unbound",
+                "graph_node_id": graph_node_id or "unbound",
             }
             if remote_asset_request
             else {}
@@ -314,6 +320,8 @@ class FirecrackerJobBuilder:
             "run_id": run_id,
             "contract_digest": contract_digest or "unbound",
             "intent_digest": intent.intent_digest,
+            "graph_digest": graph_digest or "unbound",
+            "graph_node_id": graph_node_id or "unbound",
             "argv": command,
             "working_directory": "/workspace",
             "timeout_seconds": self.resources.timeout_seconds,
@@ -404,6 +412,8 @@ class FirecrackerExecutor:
         iteration: int,
         operation_id: str,
         executor_id: str,
+        graph_digest: str = "",
+        graph_node_id: str = "",
     ) -> PreparedExecution:
         del iteration
         launch = self._builder.build(
@@ -411,6 +421,8 @@ class FirecrackerExecutor:
             run_id=run_id,
             contract_digest=contract_digest,
             operation_id=operation_id,
+            graph_digest=graph_digest,
+            graph_node_id=graph_node_id,
         )
         if not launch.remote_execution_spec_digest:
             raise FirecrackerConfigurationError("remote Firecracker preparation requires a canonical execution spec")
@@ -421,6 +433,8 @@ class FirecrackerExecutor:
             intent_digest=intent.intent_digest,
             request_digest=launch.remote_execution_spec_digest,
             remote_job_id=launch.job_id,
+            graph_digest=graph_digest,
+            graph_node_id=graph_node_id,
         )
 
     def execute(self, intent: ActionIntent) -> ExecutionObservation:
@@ -514,6 +528,8 @@ class FirecrackerExecutor:
                         "operation_id": prepared_execution.operation_id,
                         "request_digest": prepared_execution.request_digest,
                         "remote_job_id": prepared_execution.remote_job_id,
+                        "graph_digest": prepared_execution.graph_digest,
+                        "graph_node_id": prepared_execution.graph_node_id,
                     }
                     if prepared_execution is not None
                     else {}
@@ -541,6 +557,8 @@ class FirecrackerExecutor:
                 intent_digest=intent.intent_digest,
                 artifact_digests=result.artifact_digests,
                 contract_digest=self._contract_digest,
+                graph_digest=prepared_execution.graph_digest if prepared_execution is not None else None,
+                graph_node_id=prepared_execution.graph_node_id if prepared_execution is not None else None,
             )
         except (KeyError, TypeError, ValueError, ReceiptRejected):
             return "supervisor-signed execution receipt was rejected"
@@ -555,6 +573,13 @@ class FirecrackerExecutor:
         if prepared_execution is not None and (
             claims.get("operation_id") != prepared_execution.operation_id
             or claims.get("execution_spec_digest") != prepared_execution.request_digest
+            or (
+                bool(prepared_execution.graph_digest)
+                and (
+                    claims.get("graph_digest") != prepared_execution.graph_digest
+                    or claims.get("graph_node_id") != prepared_execution.graph_node_id
+                )
+            )
         ):
             return "supervisor receipt is not bound to the prepared operation"
         expected_result = "pass" if result.success and result.exit_code == 0 else "fail"
@@ -608,6 +633,8 @@ class FirecrackerExecutor:
                 "operation_id": prepared_execution.operation_id,
                 "request_digest": prepared_execution.request_digest,
                 "remote_job_id": prepared_execution.remote_job_id,
+                "graph_digest": prepared_execution.graph_digest,
+                "graph_node_id": prepared_execution.graph_node_id,
                 "reconciliation_signed": True,
                 "evaluator_receipts": {"firecracker-supervisor": result.supervisor_receipt},
             },
@@ -630,6 +657,8 @@ class FirecrackerExecutor:
                 intent_digest=intent.intent_digest,
                 artifact_digests=result.artifact_digests,
                 contract_digest=self._contract_digest,
+                graph_digest=prepared_execution.graph_digest,
+                graph_node_id=prepared_execution.graph_node_id,
             )
         except (KeyError, TypeError, ValueError, ReceiptRejected):
             return "supervisor-signed reconciliation receipt was rejected"
@@ -637,6 +666,13 @@ class FirecrackerExecutor:
         if (
             claims.get("operation_id") != prepared_execution.operation_id
             or claims.get("execution_spec_digest") != prepared_execution.request_digest
+            or (
+                bool(prepared_execution.graph_digest)
+                and (
+                    claims.get("graph_digest") != prepared_execution.graph_digest
+                    or claims.get("graph_node_id") != prepared_execution.graph_node_id
+                )
+            )
             or claims.get("reconciliation") is not True
             or claims.get("fresh_job_drive") is not True
             or claims.get("job_drive_destroyed") is not True

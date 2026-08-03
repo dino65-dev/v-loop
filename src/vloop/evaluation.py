@@ -76,6 +76,8 @@ class ProtectedEvaluationOrchestrator:
         contract: TaskContract,
         intent: ActionIntent,
         observation: ExecutionObservation,
+        graph_digest: str,
+        graph_node_id: str,
     ) -> EvidenceBundle:
         snapshot = self.snapshot_provider.snapshot(
             contract=contract,
@@ -93,5 +95,7 @@ class ProtectedEvaluationOrchestrator:
                 workspace_snapshot_digest=snapshot.workspace_snapshot_digest,
                 evaluator_image_digest=plan.evaluator_image_digest,
                 test_suite_digest=plan.test_suite_digest,
+                graph_digest=graph_digest,
+                graph_node_id=graph_node_id,
             )
         return EvidenceBundle(snapshot, receipts)
