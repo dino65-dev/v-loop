@@ -103,7 +103,17 @@ class ExecutionCertificateValidator:
             for event in trace:
                 state = states.get(event.iteration, monitor.initial_state(iteration=event.iteration))
                 try:
-                    states[event.iteration] = monitor.advance(state, event.template_node_id, event.payload)
+                    # External producers are represented by a durable
+                    # reservation followed by their signed completion.  Replay
+                    # the same two-stage state machine; treating a completion
+                    # as a fresh transition would let a certificate validate a
+                    # trace that the scheduler itself could never admit.
+                    if event.payload.get("lifecycle") == "started":
+                        states[event.iteration] = monitor.reserve(state, event.template_node_id, event.payload)
+                    elif event.template_node_id in state.started:
+                        states[event.iteration] = monitor.complete(state, event.template_node_id, event.payload)
+                    else:
+                        states[event.iteration] = monitor.advance(state, event.template_node_id, event.payload)
                 except PermissionError as exc:
                     raise PermissionError("certificate trace violates the compiled transition graph") from exc
         expected_terminal = {

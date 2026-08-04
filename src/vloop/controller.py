@@ -8,13 +8,14 @@ from typing import Iterable, Mapping, Protocol
 from uuid import uuid4
 
 from .canonical import digest
+from .attestations import CompletionClient, CompletionResult, CompletionVerifier, DevelopmentCompletionFabric
 from .completion import ActionSafetyReport, EvidenceAccumulator, FinalVerifier, TaskCompletionReport
 from .context import ContextPackage, ContextTrust
 from .evaluation import ProtectedEvaluationOrchestrator
 from .executor import Executor
 from .graph import EvidenceGraph, GraphManifest, build_evidence_graph, compile_control_graph
 from .graph_events import CausalEvent, GraphEventStore, SemanticEvidenceGraph, build_semantic_evidence_graph
-from .graph_runtime import DurableGraphScheduler
+from .graph_runtime import DurableGraphScheduler, ScheduledReservation
 from .ledger import EvidenceLedger
 from .memory import MemoryCandidateProducer, VerifiedMemoryCommitter
 from .models import (
@@ -96,6 +97,9 @@ class VerifiedLoop:
         effect_reconciler: EffectReconciler | None = None,
         evaluation_orchestrator: ProtectedEvaluationOrchestrator | None = None,
         graph_scheduler: DurableGraphScheduler | None = None,
+        completion_client: CompletionClient | None = None,
+        completion_verifier: CompletionVerifier | None = None,
+        allow_unsafe_development_completions: bool = False,
     ) -> None:
         self.contract = contract
         self.planner = planner
@@ -113,14 +117,42 @@ class VerifiedLoop:
         self.state_store = state_store
         self.effect_reconciler = effect_reconciler
         self.evaluation_orchestrator = evaluation_orchestrator
-        self.graph_manifest: GraphManifest = compile_control_graph(contract)
+        planned_receipts = (
+            {plan.check_name: plan.receipt_type for plan in evaluation_orchestrator.plans}
+            if evaluation_orchestrator is not None
+            else {}
+        )
+        self.graph_manifest: GraphManifest = compile_control_graph(contract, evaluator_receipts=planned_receipts)
         self.graph_digest = self.graph_manifest.graph_digest
         self.run_id = run_id or str(uuid4())
         graph_database = getattr(state_store, "path", ":memory:")
         self.graph_event_store = GraphEventStore(graph_database)
-        self.graph_scheduler = graph_scheduler or DurableGraphScheduler(
-            self.graph_manifest, self.graph_event_store, graph_database
-        )
+        self._unsafe_development_completions = allow_unsafe_development_completions
+        if allow_unsafe_development_completions:
+            if completion_client is not None or completion_verifier is not None:
+                raise ValueError("development completion mode cannot be combined with external completion trust")
+            roles = {
+                node.node_id: node.metadata.get("producer_role", "controller")
+                for node in self.graph_manifest.nodes
+            }
+            fabric = DevelopmentCompletionFabric(graph_digest=self.graph_digest, template_roles=roles)
+            completion_client, completion_verifier = fabric, fabric.verifier
+        if graph_scheduler is None:
+            if completion_client is None or completion_verifier is None:
+                raise RuntimeError(
+                    "evidence-native execution requires an external completion client and verifier; "
+                    "local tests must explicitly opt in to unsafe development completions"
+                )
+            graph_scheduler = DurableGraphScheduler(
+                self.graph_manifest,
+                self.graph_event_store,
+                graph_database,
+                completion_verifier=completion_verifier,
+            )
+        if completion_client is None:
+            raise RuntimeError("graph scheduler requires an external node-completion client")
+        self.completion_client = completion_client
+        self.graph_scheduler = graph_scheduler
         self._evidence = EvidenceAccumulator(self.run_id)
         self._history: list[dict] = []
         self._seen_failures: set[tuple[str, str]] = set()
@@ -169,12 +201,19 @@ class VerifiedLoop:
                     },
                 )
                 if observation.success:
-                    self._graph_advance(
+                    self._graph_complete(
+                        iteration,
+                        "executor.result",
+                        artifact_digest=digest(observation.artifact_digests),
+                        facts={"success": "true", "reconciled": "true", "operation_id": prepared_execution.operation_id},
+                        input_artifacts=observation.artifact_digests,
+                    )
+                    self._graph_complete(
                         iteration,
                         "artifact.manifest",
-                        "artifact.reconciled",
-                        {"success": True},
-                        output_artifacts=observation.artifact_digests,
+                        artifact_digest=digest(observation.artifact_digests),
+                        facts={"success": "true", "reconciled": "true"},
+                        input_artifacts=observation.artifact_digests,
                     )
             elif self._checkpoint is not None and self._checkpoint.phase in {
                 RunPhase.PENDING_AUTHORIZATION,
@@ -229,12 +268,12 @@ class VerifiedLoop:
                     return self._terminal(LoopDecision.ESCALATE, "policy-denied")
 
                 self._graph_authorise_action_rule(iteration, intent)
-                self._graph_advance(
+                self._graph_complete(
                     iteration,
                     "capability.execute",
-                    "capability.authorised",
-                    {"capability_id": capability.capability_id, "intent_digest": intent.intent_digest},
-                    authorization_ref=capability.capability_id,
+                    artifact_digest=digest({"capability_id": capability.capability_id, "intent_digest": intent.intent_digest}),
+                    facts={"capability_id": capability.capability_id, "intent_digest": intent.intent_digest},
+                    authority_refs=(capability.capability_id,),
                 )
 
                 self._tool_calls += 1
@@ -242,12 +281,12 @@ class VerifiedLoop:
                 # transition is never retried by the controller; the executor's
                 # idempotency/supervisor record must be reconciled first.
                 prepared_execution = self._prepare_execution(iteration, intent)
-                self._graph_advance(
+                self._graph_complete(
                     iteration,
                     "operation.prepared",
-                    "operation.prepared",
-                    {"operation_id": prepared_execution.operation_id},
-                    authorization_ref=capability.capability_id,
+                    artifact_digest=prepared_execution.request_digest,
+                    facts={"operation_id": prepared_execution.operation_id},
+                    authority_refs=(capability.capability_id,),
                 )
                 self._checkpoint_pending_effect(iteration, intent, prepared_execution)
                 self.ledger.append(
@@ -268,9 +307,9 @@ class VerifiedLoop:
                     binder(self.run_id, self.contract.contract_digest)
                 self._graph_advance(
                     iteration,
-                    "executor.effect",
+                    "executor.dispatch",
                     "execution.dispatched",
-                    {"success": None, "operation_id": prepared_execution.operation_id},
+                    {"operation_id": prepared_execution.operation_id},
                     authorization_ref=capability.capability_id,
                 )
                 execute_prepared = getattr(self.executor, "execute_prepared", None)
@@ -279,14 +318,23 @@ class VerifiedLoop:
                     if callable(execute_prepared)
                     else self.executor.execute(intent, capability)
                 )
+                self._graph_complete(
+                    iteration,
+                    "executor.result",
+                    artifact_digest=digest(observation.artifact_digests),
+                    result=CompletionResult.SUCCEEDED if observation.success else CompletionResult.FAILED,
+                    facts={"success": str(observation.success).lower(), "operation_id": prepared_execution.operation_id},
+                    input_artifacts=observation.artifact_digests,
+                    authority_refs=(capability.capability_id,),
+                )
                 if observation.success:
-                    self._graph_advance(
+                    self._graph_complete(
                         iteration,
                         "artifact.manifest",
-                        "artifact.produced",
-                        {"success": True},
-                        output_artifacts=observation.artifact_digests,
-                        authorization_ref=capability.capability_id,
+                        artifact_digest=digest(observation.artifact_digests),
+                        facts={"success": "true"},
+                        input_artifacts=observation.artifact_digests,
+                        authority_refs=(capability.capability_id,),
                     )
                 execution_event_hash = self.ledger.append(
                     "execution.observed",
@@ -309,40 +357,75 @@ class VerifiedLoop:
                 )
             if self.evaluation_orchestrator is not None:
                 try:
-                    evaluator_event = None
-                    if observation.success:
-                        evaluator_event = self._graph_advance(
-                            iteration, "evaluator.protected", "evaluation.requested", {}
-                        )
-                    bundle = self.evaluation_orchestrator.evaluate(
-                        run_id=self.run_id,
-                        contract=self.contract,
-                        intent=intent,
-                        observation=observation,
-                        graph_digest=self.graph_digest,
-                        graph_node_id="evaluator.protected",
-                        graph_node_instance_id=(
-                            evaluator_event.node_instance_id if evaluator_event is not None else ""
-                        ),
+                    if not observation.success:
+                        raise ValueError("failed execution has no evaluator-admissible artifact")
+                    snapshot = self.evaluation_orchestrator.materialize_snapshot(
+                        contract=self.contract, intent=intent, observation=observation
                     )
+                    self._graph_complete(
+                        iteration,
+                        "snapshot.materialized",
+                        artifact_digest=snapshot.workspace_snapshot_digest,
+                        facts={"success": "true", "workspace_generation": "0"},
+                        input_artifacts={"snapshot": snapshot.workspace_snapshot_digest},
+                    )
+                    evaluator_receipts: dict[str, Mapping] = {}
+                    graph_bindings: dict[str, Mapping[str, str]] = {}
+                    for plan in self.evaluation_orchestrator.plans:
+                        evaluator_node = f"evaluator.{self._graph_node_token(plan.check_name)}"
+                        receipt_node = f"receipt.{self._graph_node_token(plan.receipt_type)}"
+                        reservation = self._graph_reserve(iteration, evaluator_node)
+                        raw_receipt = self.evaluation_orchestrator.evaluate_plan(
+                            plan,
+                            run_id=self.run_id,
+                            contract=self.contract,
+                            intent=intent,
+                            observation=observation,
+                            snapshot=snapshot,
+                            graph_digest=self.graph_digest,
+                            graph_node_id=evaluator_node,
+                            graph_node_instance_id=reservation.node_instance_id,
+                        )
+                        evaluator_event = self._graph_complete(
+                            iteration,
+                            evaluator_node,
+                            reservation=reservation,
+                            artifact_digest=digest(raw_receipt),
+                            facts={"receipt_type": plan.receipt_type},
+                            input_artifacts=observation.artifact_digests,
+                        )
+                        receipt_event = self._graph_complete(
+                            iteration,
+                            receipt_node,
+                            artifact_digest=digest(raw_receipt),
+                            facts={"receipt_type": plan.receipt_type},
+                            evidence_refs=(
+                                str(evaluator_event.payload.get("completion_digest", ""))
+                                if evaluator_event is not None
+                                else "",
+                            ),
+                        )
+                        del receipt_event
+                        evaluator_receipts[plan.receipt_type] = raw_receipt
+                        graph_bindings[plan.receipt_type] = {
+                            "graph_digest": self.graph_digest,
+                            "graph_node_id": evaluator_node,
+                            "graph_node_instance_id": reservation.node_instance_id,
+                        }
                     existing_receipts = observation.metadata.get("evaluator_receipts", {})
                     merged_receipts = (
                         dict(existing_receipts) if isinstance(existing_receipts, Mapping) else {}
                     )
-                    merged_receipts.update(bundle.evaluator_receipts)
+                    merged_receipts.update(evaluator_receipts)
                     observation = replace(
                         observation,
                         metadata={
                             **observation.metadata,
                             "evaluator_receipts": merged_receipts,
-                            "workspace_snapshot_digest": bundle.workspace_snapshot.workspace_snapshot_digest,
-                            "workspace_snapshot_schema": bundle.workspace_snapshot.schema_version,
-                            "workspace_exclusion_policy_digest": bundle.workspace_snapshot.exclusion_policy_digest,
-                            "receipt_graph_digest": self.graph_digest,
-                            "receipt_graph_node_id": "evaluator.protected",
-                            "receipt_graph_node_instance_id": (
-                                evaluator_event.node_instance_id if evaluator_event is not None else ""
-                            ),
+                            "workspace_snapshot_digest": snapshot.workspace_snapshot_digest,
+                            "workspace_snapshot_schema": snapshot.schema_version,
+                            "workspace_exclusion_policy_digest": snapshot.exclusion_policy_digest,
+                            "receipt_graph_bindings": graph_bindings,
                         },
                     )
                     self.ledger.append(
@@ -350,10 +433,10 @@ class VerifiedLoop:
                         {
                             "run_id": self.run_id,
                             "intent_digest": intent.intent_digest,
-                            "workspace_snapshot_digest": bundle.workspace_snapshot.workspace_snapshot_digest,
-                            "receipt_types": sorted(bundle.evaluator_receipts),
+                            "workspace_snapshot_digest": snapshot.workspace_snapshot_digest,
+                            "receipt_types": sorted(evaluator_receipts),
                             "graph_digest": self.graph_digest,
-                            "graph_node_id": "evaluator.protected",
+                            "graph_node_ids": sorted(binding["graph_node_id"] for binding in graph_bindings.values()),
                         },
                     )
                 except Exception as exc:
@@ -638,8 +721,13 @@ class VerifiedLoop:
         if state.completed:
             return
         self._graph_advance(iteration, "task.contract", "task.bound", {"contract_digest": self.contract.contract_digest})
-        self._graph_advance(iteration, "principal.contract", "principal.bound", {})
-        self._graph_advance(iteration, "snapshot.workspace", "snapshot.requested", {})
+        self._graph_complete(
+            iteration,
+            "principal.contract",
+            artifact_digest=self.contract.contract_digest,
+            facts={"bound": "true"},
+        )
+        self._graph_advance(iteration, "snapshot.request", "snapshot.requested", {})
 
     def _graph_advance(
         self,
@@ -680,6 +768,85 @@ class VerifiedLoop:
             receipt_refs=receipt_refs,
         ).event
 
+    def _graph_complete(
+        self,
+        iteration: int,
+        template_node_id: str,
+        *,
+        artifact_digest: str,
+        result: CompletionResult = CompletionResult.SUCCEEDED,
+        facts: Mapping[str, str] = {},
+        input_artifacts: Mapping[str, str] = {},
+        authority_refs: tuple[str, ...] = (),
+        evidence_refs: tuple[str, ...] = (),
+        event_type: str = "node.completed",
+        reservation: ScheduledReservation | None = None,
+    ) -> CausalEvent | None:
+        """Submit a producer-owned proof; the controller never advances it directly."""
+
+        state = self.graph_scheduler.state(run_id=self.run_id, iteration=iteration)
+        if template_node_id in state.completed:
+            return next(
+                (
+                    event
+                    for event in reversed(self.graph_event_store.events(run_id=self.run_id))
+                    if event.template_node_id == template_node_id and event.iteration == iteration
+                ),
+                None,
+            )
+        reservation = reservation or self._graph_reserve(iteration, template_node_id)
+        verifier = self.graph_scheduler.completion_verifier
+        if verifier is None:  # pragma: no cover - constructor rejects this configuration
+            raise RuntimeError("evidence-native scheduler has no completion verifier")
+        completion = self.completion_client.complete(
+            graph_digest=self.graph_digest,
+            contract_digest=self.contract.contract_digest,
+            run_id=self.run_id,
+            template_node_id=template_node_id,
+            node_instance_id=reservation.node_instance_id,
+            artifact_digest=self._as_digest(artifact_digest),
+            validator_policy_digest=verifier.ownership.policy_digest,
+            result=result,
+            facts=dict(facts),
+            input_artifact_digests={key: self._as_digest(value) for key, value in input_artifacts.items()},
+            authority_refs=authority_refs,
+            evidence_refs=evidence_refs,
+        )
+        return self.graph_scheduler.complete(
+            run_id=self.run_id,
+            iteration=iteration,
+            template_node_id=template_node_id,
+            completion=completion,
+            event_type=event_type,
+            causal_parents=(reservation.event.event_id,),
+        ).event
+
+    def _graph_reserve(self, iteration: int, template_node_id: str) -> ScheduledReservation:
+        existing = self.graph_event_store.events(run_id=self.run_id)
+        return self.graph_scheduler.reserve(
+            run_id=self.run_id,
+            iteration=iteration,
+            template_node_id=template_node_id,
+            causal_parents=(existing[-1].event_id,) if existing else (),
+        )
+
+    @staticmethod
+    def _graph_node_token(value: str) -> str:
+        return "".join(character if character.isalnum() else "-" for character in value).strip("-") or "unnamed"
+
+    @staticmethod
+    def _as_digest(value: str) -> str:
+        """Admit only canonical artifact digests into signed completion fields.
+
+        Executors may expose opaque artifact handles to the controller.  They
+        remain useful in the ledger, but the signed protocol binds a digest of
+        that handle rather than treating arbitrary text as a digest.
+        """
+
+        if len(value) == 64 and all(character in "0123456789abcdef" for character in value):
+            return value
+        return digest({"artifact_reference": value})
+
     def _matching_action_rule_index(self, intent: ActionIntent) -> int:
         """Use the same closed rule shape as policy before the graph advances."""
 
@@ -698,10 +865,38 @@ class VerifiedLoop:
 
         index = self._matching_action_rule_index(intent)
         rule = self.contract.allowed_actions[index]
-        self._graph_advance(iteration, f"action.rule.{index}", "action.rule.matched", {"rule_index": str(index)})
-        if rule.approval_required:
-            self._graph_advance(iteration, f"approval.rule.{index}", "approval.consumed", {"rule_index": str(index)})
+        self._graph_complete(
+            iteration,
+            f"action.rule.{index}",
+            artifact_digest=intent.intent_digest,
+            facts={"rule_index": str(index)},
+        )
+        self._graph_advance(iteration, "join.action.rule.any", "action.rule.joined", {})
+        approval_required = self._dynamic_approval_required(intent, rule)
+        self._graph_complete(
+            iteration,
+            "policy.decision",
+            artifact_digest=digest({"intent": intent.intent_digest, "approval_required": approval_required}),
+            facts={"approval_required": str(approval_required).lower()},
+            authority_refs=(intent.intent_digest,),
+        )
+        if approval_required:
+            self._graph_complete(
+                iteration,
+                f"approval.rule.{index}",
+                artifact_digest=digest({"intent": intent.intent_digest, "approval": "consumed"}),
+                facts={"approved": "true", "rule_index": str(index)},
+                authority_refs=(intent.intent_digest,),
+            )
         self._graph_advance(iteration, "join.action.authority.any", "action.authority.joined", {})
+
+    @staticmethod
+    def _dynamic_approval_required(intent: ActionIntent, rule) -> bool:
+        high_impact = {"write", "execute", "network", "delete", "publish"}
+        tainted = any(value in {Provenance.UNTRUSTED_RETRIEVAL, Provenance.TOOL_OUTPUT} for value in intent.provenance)
+        return rule.approval_required or intent.effect.value in {"delete", "publish"} or (
+            tainted and intent.effect.value in high_impact
+        )
 
     def _graph_accept(
         self,
@@ -709,33 +904,132 @@ class VerifiedLoop:
         final_check: CheckResult,
         observation: ExecutionObservation,
     ) -> None:
-        """Emit the ALL-guard barrier before the controller is allowed to accept."""
+        """Accept only independently owned completions grounded in check evidence."""
 
-        self._graph_advance(iteration, "evaluator.protected", "evaluation.completed", {})
-        raw_receipts = observation.metadata.get("evaluator_receipts", {})
-        receipts = raw_receipts if isinstance(raw_receipts, Mapping) else {}
-        receipt_refs = tuple(
-            str(value.get("event_hash", ""))
-            for value in receipts.values()
-            if isinstance(value, Mapping) and value.get("event_hash")
+        # Whole-task acceptance is intentionally based on the accumulated,
+        # final-verifier-approved evidence set rather than only the most recent
+        # action.  This is what permits a multi-step task to bind distinct
+        # required checks to their own prior receipts.
+        report_checks: dict[str, CheckResult] = {}
+        for action in self._evidence.snapshot().actions:
+            for check in action.report.checks:
+                # A later action that does not exercise an earlier criterion
+                # reports it as inconclusive; that is not contradictory
+                # evidence and must not erase the already admitted passing
+                # receipt.  A later explicit pass refreshes the binding.
+                if check.status is CheckStatus.PASS or check.name not in report_checks:
+                    report_checks[check.name] = check
+        if self._unsafe_development_completions:
+            self._admit_development_evidence(iteration, observation, report_checks)
+        for node in self.graph_manifest.nodes:
+            if node.node_type.value != "criterion":
+                continue
+            guard = node.metadata.get("guard", "")
+            required_checks = tuple(filter(None, node.metadata.get("required_checks", guard).split(",")))
+            checks = tuple(report_checks.get(name) for name in required_checks)
+            if (
+                self._unsafe_development_completions
+                and guard not in self.contract.success_condition_bindings
+                and report_checks.get("execution", CheckResult("execution", CheckStatus.FAIL, {})).status is CheckStatus.PASS
+            ):
+                # Legacy unit contracts without declared condition bindings
+                # are admissible only in the explicitly unsafe test adapter.
+                required_checks, checks = ("execution",), (report_checks["execution"],)
+            if not checks or any(check is None or check.status is not CheckStatus.PASS for check in checks):
+                raise PermissionError(f"no passing criterion evidence exists for guard {guard!r}")
+            receipt_node = f"receipt.{self._graph_node_token(guard)}"
+            receipt_event = next(
+                (
+                    event
+                    for event in reversed(self.graph_event_store.events(run_id=self.run_id))
+                    if event.template_node_id == receipt_node
+                ),
+                None,
+            )
+            if receipt_event is None:
+                raise PermissionError(f"criterion {guard!r} has no admitted receipt evidence")
+            self._graph_complete(
+                iteration,
+                node.node_id,
+                artifact_digest=digest({
+                    "guard": guard,
+                    "checks": [(check.name, dict(check.evidence)) for check in checks if check is not None],
+                }),
+                facts={"passed": "true", "guard": guard},
+                evidence_refs=(str(receipt_event.payload.get("completion_digest", "")),),
+            )
+        self._graph_advance(iteration, "join.guards.all", "guards.joined", {})
+        self._graph_complete(
+            iteration,
+            "decision.accept",
+            artifact_digest=digest({"final_check": final_check.name, "evidence": dict(final_check.evidence)}),
+            facts={"decision": "accept"},
+            evidence_refs=tuple(
+                str(event.payload.get("completion_digest", ""))
+                for event in self.graph_event_store.events(run_id=self.run_id)
+                if event.template_node_id.startswith("criterion.") and event.iteration == iteration
+            ),
         )
+
+    def _admit_development_evidence(
+        self,
+        iteration: int,
+        observation: ExecutionObservation,
+        report_checks: Mapping[str, CheckResult],
+    ) -> None:
+        """Explicit test-only adapter; production must use protected services."""
+
+        snapshot_state = self.graph_scheduler.state(run_id=self.run_id, iteration=iteration)
+        if "snapshot.materialized" not in snapshot_state.completed:
+            self._graph_complete(
+                iteration,
+                "snapshot.materialized",
+                artifact_digest=digest({"development": "snapshot", "artifacts": observation.artifact_digests}),
+                facts={"success": "true", "workspace_generation": "0"},
+            )
         for node in self.graph_manifest.nodes:
-            if node.node_type.value == "evaluator" and node.node_id != "evaluator.protected":
-                self._graph_advance(iteration, node.node_id, "evaluation.check.completed", {"passed": True})
-        for node in self.graph_manifest.nodes:
-            if node.node_type.value == "receipt":
-                self._graph_advance(
+            if node.node_type.value == "evaluator":
+                self._graph_complete(
                     iteration,
                     node.node_id,
-                    "receipt.accepted",
-                    {"passed": True, "final_goal": final_check.status.value},
-                    receipt_refs=receipt_refs,
+                    artifact_digest=digest({"development": "evaluator", "check": node.metadata.get("check_name", "")}),
+                    facts={"check_name": node.metadata.get("check_name", "")},
+                    input_artifacts=observation.artifact_digests,
                 )
         for node in self.graph_manifest.nodes:
-            if node.node_type.value == "criterion":
-                self._graph_advance(iteration, node.node_id, "criterion.satisfied", {"passed": True})
-        self._graph_advance(iteration, "join.guards.all", "guards.joined", {})
-        self._graph_advance(iteration, "decision.accept", "decision.accepted", {"decision": "accept"})
+            if node.node_type.value != "receipt":
+                continue
+            receipt_type = node.metadata.get("receipt_type", "")
+            criterion = next(
+                (
+                    candidate
+                    for candidate in self.graph_manifest.nodes
+                    if candidate.node_type.value == "criterion" and candidate.metadata.get("guard") == receipt_type
+                ),
+                None,
+            )
+            required = tuple(filter(None, (criterion.metadata.get("required_checks", receipt_type) if criterion else receipt_type).split(",")))
+            checks = tuple(report_checks.get(name) for name in required)
+            if (
+                receipt_type not in self.contract.success_condition_bindings
+                and report_checks.get("execution", CheckResult("execution", CheckStatus.FAIL, {})).status is CheckStatus.PASS
+            ):
+                required, checks = ("execution",), (report_checks["execution"],)
+            # This path exists only behind the explicit development switch.
+            # It synthesizes a condition receipt from the contract-declared
+            # bound checks, preserving the same condition/receipt topology as
+            # a protected evaluator deployment.
+            if checks and all(check is not None and check.status is CheckStatus.PASS for check in checks):
+                self._graph_complete(
+                    iteration,
+                    node.node_id,
+                    artifact_digest=digest({
+                        "development": "receipt",
+                        "receipt_type": receipt_type,
+                        "checks": [(check.name, dict(check.evidence)) for check in checks if check is not None],
+                    }),
+                    facts={"receipt_type": receipt_type, "passed": "true"},
+                )
 
     def _save_checkpoint(
         self,

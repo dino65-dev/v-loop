@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from .canonical import canonical_json
+from .attestations import CompletionResult, CompletionVerifier, ValidatedNodeCompletion
 from .graph import DynamicSubgraphPolicy, GraphManifest, GraphNode
 from .graph_schema import NodeImplementation
 from .graph_events import CausalEvent, GraphEventStore, new_event_id, node_instance_id
@@ -20,6 +21,13 @@ from .models import TaskContract
 @dataclass(frozen=True, slots=True)
 class ScheduledTransition:
     event: CausalEvent
+    state: TransitionState
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduledReservation:
+    event: CausalEvent
+    node_instance_id: str
     state: TransitionState
 
 
@@ -85,9 +93,15 @@ class DurableGraphScheduler:
         database: str | Path = ":memory:",
         *,
         joins: tuple[GraphJoin, ...] = (),
+        completion_verifier: CompletionVerifier | None = None,
     ) -> None:
         self.monitor = TransitionMonitor(manifest, joins=joins or manifest.joins)
         self.event_store = event_store
+        self.completion_verifier = completion_verifier
+        self._roles = {
+            node.node_id: node.metadata.get("producer_role", "controller")
+            for node in manifest.nodes
+        }
         if Path(database) != event_store.path:
             raise ValueError("scheduler state and causal events must share one SQLite database")
         self._connection = event_store._connection
@@ -111,7 +125,12 @@ class DurableGraphScheduler:
         if row is None:
             return self.monitor.initial_state(iteration=iteration)
         value = json.loads(row[0])
-        return TransitionState(iteration, frozenset(value["completed"]), dict(value["events"]))
+        return TransitionState(
+            iteration,
+            frozenset(value["completed"]),
+            dict(value["events"]),
+            dict(value.get("started", {})),
+        )
 
     def advance(
         self,
@@ -126,9 +145,29 @@ class DurableGraphScheduler:
         output_artifacts: Mapping[str, str] = {},
         authorization_ref: str = "",
         receipt_refs: tuple[str, ...] = (),
+        completion: ValidatedNodeCompletion | None = None,
     ) -> ScheduledTransition:
         if not run_id.strip() or iteration < 1:
             raise ValueError("scheduled transitions need a run and positive iteration")
+        role = self._roles.get(template_node_id)
+        if role is None:
+            raise PermissionError("graph node has no producer ownership assignment")
+        if self.completion_verifier is not None and role not in {"controller", "scheduler"}:
+            if completion is None:
+                raise PermissionError("externally owned graph nodes require a validated completion")
+            return self._complete_direct(
+                run_id=run_id,
+                iteration=iteration,
+                template_node_id=template_node_id,
+                event_type=event_type,
+                completion=completion,
+                payload=payload,
+                causal_parents=causal_parents,
+                input_artifacts=input_artifacts,
+                output_artifacts=output_artifacts,
+                authorization_ref=authorization_ref,
+                receipt_refs=receipt_refs,
+            )
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             state = self.state(run_id=run_id, iteration=iteration)
@@ -166,6 +205,132 @@ class DurableGraphScheduler:
             raise
         return ScheduledTransition(event, next_state)
 
+    def reserve(
+        self,
+        *,
+        run_id: str,
+        iteration: int,
+        template_node_id: str,
+        event_type: str = "node.started",
+        payload: Mapping[str, Any] = {},
+        causal_parents: tuple[str, ...] = (),
+    ) -> ScheduledReservation:
+        """Reserve an enabled external node before asking its producer to act."""
+
+        if not run_id.strip() or iteration < 1:
+            raise ValueError("scheduled reservations need a run and positive iteration")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            state = self.state(run_id=run_id, iteration=iteration)
+            next_state = self.monitor.reserve(state, template_node_id, payload)
+            attempts = self._attempts(run_id, iteration)
+            attempt = attempts.get(template_node_id, 0) + 1
+            attempts[template_node_id] = attempt
+            instance = node_instance_id(
+                run_id=run_id, graph_digest=self.manifest.graph_digest,
+                template_node_id=template_node_id, iteration=iteration, attempt=attempt,
+            )
+            started = {**next_state.started, template_node_id: {**next_state.started[template_node_id], "node_instance_id": instance, "attempt": attempt}}
+            next_state = TransitionState(next_state.iteration, next_state.completed, next_state.events, started)
+            event = CausalEvent(
+                new_event_id(), run_id, self.manifest.graph_digest, instance, template_node_id,
+                event_type, iteration, attempt, causal_parents=causal_parents, payload={"lifecycle": "started", **dict(payload)},
+            )
+            self.event_store.append(event, commit=False)
+            self._save(run_id, next_state, attempts)
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+        return ScheduledReservation(event, instance, next_state)
+
+    def complete(
+        self,
+        *,
+        run_id: str,
+        iteration: int,
+        template_node_id: str,
+        completion: ValidatedNodeCompletion,
+        event_type: str = "node.completed",
+        causal_parents: tuple[str, ...] = (),
+    ) -> ScheduledTransition:
+        """Accept only a producer-authenticated completion for a reservation."""
+
+        return self._complete_direct(
+            run_id=run_id, iteration=iteration, template_node_id=template_node_id,
+            event_type=event_type, completion=completion, payload={}, causal_parents=causal_parents,
+            input_artifacts=completion.input_artifact_digests,
+            output_artifacts={"primary": completion.artifact_digest},
+            authorization_ref=completion.authority_refs[0] if completion.authority_refs else "",
+            receipt_refs=completion.evidence_refs,
+        )
+
+    def _complete_direct(
+        self,
+        *,
+        run_id: str,
+        iteration: int,
+        template_node_id: str,
+        event_type: str,
+        completion: ValidatedNodeCompletion,
+        payload: Mapping[str, Any],
+        causal_parents: tuple[str, ...],
+        input_artifacts: Mapping[str, str],
+        output_artifacts: Mapping[str, str],
+        authorization_ref: str,
+        receipt_refs: tuple[str, ...],
+    ) -> ScheduledTransition:
+        if self.completion_verifier is None:
+            raise PermissionError("validated completions require a configured ownership verifier")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            state = self.state(run_id=run_id, iteration=iteration)
+            started = state.started.get(template_node_id)
+            if started is None:
+                raise PermissionError("external node completion has no prior reservation")
+            instance = str(started.get("node_instance_id", ""))
+            self.completion_verifier.validate(
+                completion,
+                expected_graph_digest=self.manifest.graph_digest,
+                expected_contract_digest=self.manifest.contract_digest,
+                expected_run_id=run_id,
+                expected_template_node_id=template_node_id,
+                expected_node_instance_id=instance,
+            )
+            # Completion facts are deliberately serialized as strings for the
+            # signed wire format.  The graph's closed condition vocabulary,
+            # however, models pass/fail as booleans.  Decode only that closed
+            # field; leave policy predicates (for example ``rule_index``) as
+            # their authenticated textual values.
+            facts = dict(completion.facts)
+            if facts.get("passed") in {"true", "false"}:
+                facts["passed"] = facts["passed"] == "true"
+            completion_payload = {
+                **facts,
+                "result": completion.result.value,
+                "success": completion.result is CompletionResult.SUCCEEDED,
+                "completion_digest": completion.completion_digest,
+                "producer_identity": completion.producer_identity,
+                "producer_role": completion.producer_role,
+                "artifact_digest": completion.artifact_digest,
+                **dict(payload),
+            }
+            next_state = self.monitor.complete(state, template_node_id, completion_payload)
+            event = CausalEvent(
+                new_event_id(), run_id, self.manifest.graph_digest, instance, template_node_id,
+                event_type, iteration, int(started.get("attempt", 1)), causal_parents=causal_parents,
+                input_artifacts=input_artifacts, output_artifacts=output_artifacts,
+                authorization_ref=authorization_ref, receipt_refs=receipt_refs,
+                payload={"lifecycle": completion.result.value, **completion_payload},
+            )
+            self.event_store.append(event, commit=False)
+            self._save(run_id, next_state, self._attempts(run_id, iteration))
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+        return ScheduledTransition(event, next_state)
+
     def _attempts(self, run_id: str, iteration: int) -> dict[str, int]:
         row = self._connection.execute(
             "SELECT attempts_json FROM graph_scheduler_state WHERE run_id = ? AND graph_digest = ? AND iteration = ?",
@@ -174,7 +339,7 @@ class DurableGraphScheduler:
         return dict(json.loads(row[0])) if row else {}
 
     def _save(self, run_id: str, state: TransitionState, attempts: Mapping[str, int]) -> None:
-        payload = canonical_json({"completed": sorted(state.completed), "events": dict(state.events)})
+        payload = canonical_json({"completed": sorted(state.completed), "events": dict(state.events), "started": dict(state.started)})
         self._connection.execute(
             """INSERT INTO graph_scheduler_state VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(run_id, graph_digest, iteration) DO UPDATE SET

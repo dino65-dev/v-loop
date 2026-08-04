@@ -108,6 +108,18 @@ class WorkspaceTransition:
             raise ValueError("workspace transition must advance to a new snapshot")
         if self.artifact.input_artifact_digests.get("parent_snapshot") != self.parent_snapshot_digest:
             raise ValueError("workspace transition does not bind its parent snapshot input")
+        expected_payload = digest(
+            {
+                "parent_snapshot_digest": self.parent_snapshot_digest,
+                "output_snapshot_digest": self.output_snapshot_digest,
+                "operation_id": self.operation_id,
+                "changed_paths": self.changed_paths,
+                "artifact_manifest_digest": self.artifact_manifest_digest,
+                "supervisor_receipt_digest": self.supervisor_receipt_digest,
+            }
+        )
+        if self.artifact.payload_digest != expected_payload:
+            raise ValueError("workspace transition fields are not covered by the signed artifact payload")
 
 
 class ArtifactSigner:

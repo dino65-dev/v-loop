@@ -285,6 +285,7 @@ def test_loop_accepts_only_after_independent_checks(tmp_path: Path) -> None:
     ledger = EvidenceLedger(tmp_path / "ledger.db")
     loop = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=Planner(task),
         gate=PolicyGate(task, signing_key=b"z" * 32),
         executor=Executor(),
@@ -320,6 +321,7 @@ def test_typed_graph_kernel_binds_runs_and_rejects_unauthorised_effects(tmp_path
     ledger = EvidenceLedger(tmp_path / "ledger.db")
     loop = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=Planner(task),
         gate=PolicyGate(task, signing_key=b"g" * 32),
         executor=Executor(),
@@ -545,6 +547,7 @@ def test_failed_execution_cannot_advance_criteria_even_if_a_verifier_is_wrong(tm
     state = SQLiteRunStateStore(tmp_path / "state.db")
     loop = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=Planner(task),
         gate=PolicyGate(task, signing_key=b"z" * 32),
         executor=FailedExecutor(),
@@ -746,6 +749,7 @@ def test_neural_shadow_diagnostic_is_redacted_and_cannot_override_acceptance(tmp
     ledger = EvidenceLedger(tmp_path / "ledger.db")
     loop = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=Planner(task),
         gate=PolicyGate(task, signing_key=b"z" * 32),
         executor=Executor(),
@@ -1110,6 +1114,7 @@ def test_final_goal_verifier_is_required_before_controller_acceptance(tmp_path: 
     ledger = EvidenceLedger(tmp_path / "ledger.db")
     loop = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=Planner(task),
         gate=PolicyGate(task, signing_key=b"q" * 32),
         executor=Executor(),
@@ -1158,6 +1163,7 @@ def test_controller_promotes_only_finally_verified_and_attested_memory(tmp_path:
     memories = MemoryLedger(tmp_path / "memory.db", ledger)
     loop = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=Planner(task),
         gate=PolicyGate(task, signing_key=b"m" * 32),
         executor=Executor(),
@@ -1221,6 +1227,7 @@ def test_probes_are_registered_protected_checks_and_run_after_evidence_gap(tmp_p
     ledger = EvidenceLedger(tmp_path / "ledger.db")
     loop = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=Planner(task),
         gate=PolicyGate(task, signing_key=b"p" * 32),
         executor=Executor(),
@@ -1270,6 +1277,7 @@ def test_context_taint_is_conservatively_propagated_to_policy(tmp_path: Path) ->
     ledger = EvidenceLedger(tmp_path / "ledger.db")
     loop = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=WritePlanner(),
         gate=PolicyGate(task, signing_key=b"c" * 32),
         executor=Executor(),
@@ -1673,6 +1681,9 @@ def test_signed_receipt_binds_evaluator_claim_to_run_intent_and_artifact() -> No
         toolchain_digest="toolchain-digest",
         environment_digest="environment-digest",
         verifier_policy_digest=policy.policy_digest,
+        graph_digest="a" * 64,
+        graph_node_id="evaluator-differential",
+        graph_node_instance_id="b" * 64,
     )
     observation = ExecutionObservation(
         True,
@@ -1680,7 +1691,16 @@ def test_signed_receipt_binds_evaluator_claim_to_run_intent_and_artifact() -> No
         "",
         "",
         artifacts,
-        {"evaluator_receipts": {"differential": receipt.as_mapping()}},
+        {
+            "evaluator_receipts": {"differential": receipt.as_mapping()},
+            "receipt_graph_bindings": {
+                "differential": {
+                    "graph_digest": "a" * 64,
+                    "graph_node_id": "evaluator-differential",
+                    "graph_node_instance_id": "b" * 64,
+                }
+            },
+        },
     )
     verifier = HybridVerifier(
         [
@@ -1934,6 +1954,7 @@ def test_controller_accumulates_independent_criteria_without_repairing_safe_prog
     ledger = EvidenceLedger(tmp_path / "ledger.db")
     loop = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=TwoStepPlanner(),
         gate=PolicyGate(task, signing_key=b"i" * 32),
         executor=TwoStepExecutor(),
@@ -2026,6 +2047,7 @@ def test_multistep_completion_promotes_memory_from_aggregate_evidence(tmp_path: 
     memories = MemoryLedger(tmp_path / "memory.db", ledger)
     loop = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=TwoStepPlanner(),
         gate=PolicyGate(task, signing_key=b"m" * 32),
         executor=TwoStepExecutor(),
@@ -2065,6 +2087,7 @@ def test_successful_action_cannot_bypass_registered_adversarial_probe(tmp_path: 
     ledger = EvidenceLedger(tmp_path / "ledger.db")
     loop = VerifiedLoop(
         contract=replace(task, maximum_iterations=1),
+        allow_unsafe_development_completions=True,
         planner=Planner(task),
         gate=PolicyGate(task, signing_key=b"u" * 32),
         executor=Executor(),
@@ -2114,6 +2137,7 @@ def test_safe_criterion_progress_runs_preaccept_probes_and_global_guards(tmp_pat
     ledger = EvidenceLedger(tmp_path / "ledger.db")
     loop = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=Planner(task),
         gate=PolicyGate(task, signing_key=b"g" * 32),
         executor=Executor(),
@@ -2185,6 +2209,7 @@ def test_controller_orchestrates_protected_evaluator_receipts(tmp_path: Path) ->
     ledger = EvidenceLedger(tmp_path / "ledger.db")
     loop = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=Planner(task),
         gate=PolicyGate(task, signing_key=b"v" * 32),
         executor=Executor(),
@@ -2707,6 +2732,7 @@ def test_controller_resumes_verified_progress_but_never_replays_a_pending_effect
     run_id = "resumable-run"
     first = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=CrashAfterFirstPlanner(),
         gate=PolicyGate(task, signing_key=b"r" * 32),
         executor=Executor(),
@@ -2723,6 +2749,7 @@ def test_controller_resumes_verified_progress_but_never_replays_a_pending_effect
 
     resumed = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=HealthyPlanner(),
         gate=PolicyGate(task, signing_key=b"r" * 32),
         executor=Executor(),
@@ -2743,6 +2770,7 @@ def test_controller_resumes_verified_progress_but_never_replays_a_pending_effect
     uncertain_run = "pending-effect-run"
     uncertain = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=HealthyPlanner(),
         gate=PolicyGate(task, signing_key=b"t" * 32),
         executor=CrashExecutor(),
@@ -2765,6 +2793,7 @@ def test_controller_resumes_verified_progress_but_never_replays_a_pending_effect
 
     reconciler_wait = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=HealthyPlanner(),
         gate=PolicyGate(task, signing_key=b"t" * 32),
         executor=NeverReplayExecutor(),
@@ -2797,6 +2826,7 @@ def test_controller_persists_exact_prepared_operation_before_effect_dispatch(tmp
 
     loop = VerifiedLoop(
         contract=task,
+        allow_unsafe_development_completions=True,
         planner=Planner(task),
         gate=PolicyGate(task, signing_key=b"p" * 32),
         executor=InspectingCrashExecutor(),
@@ -2831,6 +2861,7 @@ def test_approval_wait_and_effect_reconciliation_are_resumable(tmp_path: Path) -
     run_id = "approval-wait"
     waiting = VerifiedLoop(
         contract=approval_task,
+        allow_unsafe_development_completions=True,
         planner=WritePlanner(),
         gate=PolicyGate(approval_task, signing_key=b"p" * 32),
         executor=Executor(),
@@ -2851,6 +2882,7 @@ def test_approval_wait_and_effect_reconciliation_are_resumable(tmp_path: Path) -
 
     resumed = VerifiedLoop(
         contract=approval_task,
+        allow_unsafe_development_completions=True,
         planner=NoSecondProposal(),
         gate=PolicyGate(approval_task, signing_key=b"p" * 32),
         executor=Executor(),
@@ -2889,6 +2921,7 @@ def test_approval_wait_and_effect_reconciliation_are_resumable(tmp_path: Path) -
     effect_run_id = "effect-reconcile"
     crashed = VerifiedLoop(
         contract=effect_task,
+        allow_unsafe_development_completions=True,
         planner=Planner(effect_task),
         gate=PolicyGate(effect_task, signing_key=b"e" * 32),
         executor=CrashExecutor(),
@@ -2931,6 +2964,7 @@ def test_approval_wait_and_effect_reconciliation_are_resumable(tmp_path: Path) -
 
     reconciled = VerifiedLoop(
         contract=effect_task,
+        allow_unsafe_development_completions=True,
         planner=NoSecondProposal(),
         gate=PolicyGate(effect_task, signing_key=b"e" * 32),
         executor=NeverReplayExecutor(),

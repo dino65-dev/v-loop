@@ -50,16 +50,16 @@ Enabled(node) == /\ node \in Nodes
                  /\ Predecessors[node] \subseteq completed
 Advance(node) == /\ Enabled(node)
                  /\ completed' = completed \cup {{node}}
-                 /\ effectDispatched' = effectDispatched \/ (node = "executor.effect")
-                 /\ effectResolved' = effectResolved \/ (node \in {{"artifact.manifest", "operation.reconcile"}})
+                 /\ effectDispatched' = effectDispatched \/ (node = "executor.dispatch")
+                 /\ effectResolved' = effectResolved \/ (node \in {{"executor.result", "operation.reconcile"}})
                  /\ UNCHANGED cancelled
 Cancel == /\ cancelled' = TRUE
           /\ UNCHANGED <<completed, effectDispatched, effectResolved>>
 Next == (\E node \in Nodes : Advance(node)) \/ Cancel
-NoEffectWithoutCapability == "executor.effect" \in completed => "capability.execute" \in completed
+NoEffectWithoutCapability == "executor.dispatch" \in completed => "capability.execute" \in completed
 NoAcceptWithoutAllGuards == Accept \in completed => GuardNodes \subseteq completed
 NoAcceptWithoutPredecessors == Accept \in completed => Predecessors[Accept] \subseteq completed
-NoEffectReplayAfterIndeterminate == effectDispatched /\ ~effectResolved => "executor.effect" \notin (completed \setminus {{"executor.effect"}})
+NoEffectReplayAfterIndeterminate == effectDispatched /\ ~effectResolved => "executor.dispatch" \notin (completed \setminus {{"executor.dispatch"}})
 EventualReconciliation == effectDispatched => <>(effectResolved \/ cancelled)
 Spec == Init /\ [][Next]_<<completed, cancelled, effectDispatched, effectResolved>>
 TypeOK == completed \subseteq Nodes /\ GuardNodes \subseteq Nodes

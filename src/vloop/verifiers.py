@@ -263,6 +263,25 @@ class SignedReceiptVerifier:
             return CheckResult(self.name, CheckStatus.INCONCLUSIVE, {}, "missing signed evaluator receipt")
         try:
             receipt = EvaluationReceipt.from_mapping(raw)
+            bindings = observation.metadata.get("receipt_graph_bindings", {})
+            binding = bindings.get(self.receipt_type, {}) if isinstance(bindings, Mapping) else {}
+            graph_digest = (
+                str(binding.get("graph_digest", ""))
+                if isinstance(binding, Mapping)
+                else ""
+            )
+            graph_node_id = (
+                str(binding.get("graph_node_id", ""))
+                if isinstance(binding, Mapping)
+                else ""
+            )
+            graph_node_instance_id = (
+                str(binding.get("graph_node_instance_id", ""))
+                if isinstance(binding, Mapping)
+                else ""
+            )
+            if not graph_digest or not graph_node_id or not graph_node_instance_id:
+                raise ReceiptRejected("receipt lacks a concrete evaluator graph-node binding")
             self.receipt_verifier.validate(
                 receipt,
                 receipt_type=self.receipt_type,
@@ -270,13 +289,9 @@ class SignedReceiptVerifier:
                 intent_digest=intent.intent_digest,
                 artifact_digests=observation.artifact_digests,
                 contract_digest=contract.contract_digest,
-                graph_digest=_metadata_string(observation.metadata, "receipt_graph_digest"),
-                graph_node_id=_metadata_string(observation.metadata, "receipt_graph_node_id"),
-                graph_node_instance_id=(
-                    _metadata_string(observation.metadata, "receipt_graph_node_instance_id")
-                    if _metadata_string(observation.metadata, "receipt_graph_node_instance_id")
-                    else None
-                ),
+                graph_digest=graph_digest,
+                graph_node_id=graph_node_id,
+                graph_node_instance_id=graph_node_instance_id or None,
             )
         except (KeyError, TypeError, ValueError, ReceiptRejected) as exc:
             return CheckResult(

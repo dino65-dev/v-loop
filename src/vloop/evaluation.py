@@ -80,24 +80,60 @@ class ProtectedEvaluationOrchestrator:
         graph_node_id: str,
         graph_node_instance_id: str = "",
     ) -> EvidenceBundle:
-        snapshot = self.snapshot_provider.snapshot(
-            contract=contract,
-            intent=intent,
-            observation=observation,
-        )
+        snapshot = self.materialize_snapshot(contract=contract, intent=intent, observation=observation)
         receipts: dict[str, Mapping] = {}
         for plan in self.plans:
-            receipts[plan.receipt_type] = plan.client.evaluate(
+            receipts[plan.receipt_type] = self.evaluate_plan(
+                plan,
                 run_id=run_id,
-                contract_digest=contract.contract_digest,
-                intent_digest=intent.intent_digest,
-                receipt_type=plan.receipt_type,
-                artifact_digests=observation.artifact_digests,
-                workspace_snapshot_digest=snapshot.workspace_snapshot_digest,
-                evaluator_image_digest=plan.evaluator_image_digest,
-                test_suite_digest=plan.test_suite_digest,
+                contract=contract,
+                intent=intent,
+                observation=observation,
+                snapshot=snapshot,
                 graph_digest=graph_digest,
                 graph_node_id=graph_node_id,
                 graph_node_instance_id=graph_node_instance_id,
             )
         return EvidenceBundle(snapshot, receipts)
+
+    def materialize_snapshot(
+        self,
+        *,
+        contract: TaskContract,
+        intent: ActionIntent,
+        observation: ExecutionObservation,
+    ) -> WorkspaceSnapshot:
+        return self.snapshot_provider.snapshot(
+            contract=contract,
+            intent=intent,
+            observation=observation,
+        )
+
+    @staticmethod
+    def evaluate_plan(
+        plan: ProtectedEvaluatorPlan,
+        *,
+        run_id: str,
+        contract: TaskContract,
+        intent: ActionIntent,
+        observation: ExecutionObservation,
+        snapshot: WorkspaceSnapshot,
+        graph_digest: str,
+        graph_node_id: str,
+        graph_node_instance_id: str,
+    ) -> Mapping:
+        if not graph_digest or not graph_node_id or not graph_node_instance_id:
+            raise ValueError("each protected evaluator call needs a concrete graph node instance")
+        return plan.client.evaluate(
+            run_id=run_id,
+            contract_digest=contract.contract_digest,
+            intent_digest=intent.intent_digest,
+            receipt_type=plan.receipt_type,
+            artifact_digests=observation.artifact_digests,
+            workspace_snapshot_digest=snapshot.workspace_snapshot_digest,
+            evaluator_image_digest=plan.evaluator_image_digest,
+            test_suite_digest=plan.test_suite_digest,
+            graph_digest=graph_digest,
+            graph_node_id=graph_node_id,
+            graph_node_instance_id=graph_node_instance_id,
+        )
