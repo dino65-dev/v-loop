@@ -14,37 +14,253 @@ model outside the trusted computing base:
 The controller may propose an action, but only the deterministic policy gate
 can authorize it and only independently recorded evidence can satisfy a task.
 
-## Graph runtime and harness evolution
+## Package map
 
-The compiled control graph makes the production route inspectable rather than
-implicit in controller branches:
+The public Python surface is organized by trust boundary. Existing flat-module
+imports remain compatible; new integrations should use these namespaces.
 
 ```text
-task + principal → action → capability → prepared operation → executor
-      │                                                   ├→ reconciliation → escalation
-      └→ immutable workspace snapshot                     └→ artifact manifest
-                                                              ↓
-snapshot + artifact → protected evaluator → signed receipt → criteria → accept
+vloop/
+├── control/        contracts, capabilities, policy, controller, runtime, checkpoints
+├── evidence/       attestations, snapshots, receipts, ledger, certificates
+├── execution/      executor adapters, Firecracker boundary, supervisor client
+├── intelligence/   untrusted planning, context, memory, probes, repair, shadow model
+├── governance/     harness experiments, promotion, rollback, delegation
+├── graph*.py       typed graph compiler, monitor, scheduler, formal model
+├── models.py       immutable shared domain models
+└── canonical.py    canonical JSON and SHA-256 primitives
 ```
 
-`compile_control_graph(contract)` returns an immutable `GraphManifest` and
-its SHA-256 `graph_digest`. `VerifiedLoop` persists that digest in the run
-checkpoint, binds it to the capability and prepared operation, transmits it to
-the Firecracker supervisor and protected evaluator, and requires the signed
-receipt to name the expected evaluator graph node. An otherwise valid receipt
-from another graph or node is rejected.
+The namespaces are an import and ownership boundary, not a claim that all code
+inside a process is isolated. The production deployment boundaries remain the
+separate policy, supervisor, evaluator, and ledger services.
 
-`DynamicSubgraphPolicy` admits only contract-bound read-only analysis graphs
-composed of approved node and edge types. It rejects cycles and any
-authority-bearing node, so dynamic planning can remove work but cannot add
-authority.
+## Architecture: how a run actually works
 
-`HarnessRegistry` is the controlled path for changing context, tool, routing,
-probe, evaluator, memory, or repair components. A proposal stores its predicted
-metric, expected failure mode, affected task classes, immutable baseline, and
-minimum improvement. It needs held-out shadow evidence, an independent
-reviewer to promote it, and a second independent reviewer to roll it back;
-rollback refuses to overwrite a newer version.
+V-Loop is deliberately not an autonomous shell wrapper. It is a control plane
+for a bounded task: the model may propose an `ActionIntent`, but it cannot
+issue a capability, complete an externally owned graph node, accept a run, or
+write the evidence ledger directly.
+
+```mermaid
+flowchart LR
+    U[Task contract and principal] --> C[Graph compiler]
+    C --> G[Immutable GraphManifest<br/>graph_digest]
+    M[Planner or LLM<br/>untrusted] --> I[ActionIntent]
+    I --> P[PolicyGate]
+    G --> P
+    P -->|deny or wait| X[Stop / escalation / approval wait]
+    P -->|signed short-lived capability| O[Prepare exact operation]
+    O --> D[Controller dispatch]
+    D --> S[Privileged executor supervisor]
+    S --> R[Signed executor result]
+    R --> A[Artifact manifest]
+    A --> E[Protected evaluators]
+    W[Immutable workspace snapshot] --> E
+    E --> Q[Signed receipts]
+    Q --> K[Criterion verifiers]
+    K --> J{All required criteria?}
+    J -->|yes| V[Independent accept completion]
+    J -->|no| X
+    V --> L[Hash-chained ledger and certificate]
+```
+
+The compiler produces a versioned `GraphManifest`. Its SHA-256
+`graph_digest` is carried through the capability, prepared operation,
+supervisor/evaluator requests, receipts, checkpoint, and final certificate.
+This makes a proof for one graph or run unusable for another.
+
+### 1. Graph scheduler: reserve, then prove completion
+
+The controller is the only component that advances the graph, but it is not
+trusted to manufacture results from services it does not own. A remote-owned
+node must first be reserved. Its owner then returns a signed
+`ValidatedNodeCompletion` for that exact reservation; only then can the
+scheduler commit the node and causal event.
+
+```mermaid
+sequenceDiagram
+    participant C as Controller
+    participant GS as DurableGraphScheduler
+    participant X as Node owner service
+    participant E as GraphEventStore
+
+    C->>GS: reserve(run, graph, template node)
+    GS->>E: atomic node.started event + durable state
+    GS-->>C: immutable node_instance_id
+    C->>X: request work bound to graph/run/node instance
+    X-->>C: signed ValidatedNodeCompletion
+    C->>GS: complete(reservation, completion)
+    GS->>GS: verify identity, role, signature, TTL, bindings
+    GS->>E: atomic node.completed event + durable state
+```
+
+Every completion binds the graph digest, contract digest, run ID, template
+node ID, realized node-instance ID, producer role, artifact digest, ownership
+policy digest, result, nonce, issue/expiry time, and authority/evidence
+references. The monitor rejects a direct completion for an externally owned
+node, a completion without a reservation, a replayed instance, expired work,
+the wrong workload role, or a completion for a different graph/run.
+
+The state machine also makes dependencies executable. A downstream transition
+checks facts emitted by its already-completed predecessor. In particular,
+`execution.success` reads the authenticated executor result; a target payload
+cannot claim success to unlock itself.
+
+### 2. Authorization and dynamic approval
+
+```mermaid
+flowchart TD
+    I[ActionIntent] --> R[Selected immutable ActionRule]
+    R --> JR{Rule join}
+    JR --> PD[Signed policy decision]
+    PD -->|approval_required = false| JA{Authority join}
+    PD -->|approval_required = true| AP[Signed approval receipt]
+    AP --> JA
+    PR[Principal authority] --> CAP[Capability verifier]
+    JA --> CAP
+    CAP --> SC[Short-lived, audience-bound capability]
+    SC --> OP[Prepared operation with idempotency key]
+    OP --> DIS[executor.dispatch]
+```
+
+`PolicyGate` is deterministic and default-deny. It matches the requested
+tool, effect, target, typed arguments, contract version, provenance DAG,
+budget, expiry, and approval requirements before minting a short-lived,
+Ed25519-signed capability for one executor audience. Executor-side verification
+and durable nonce/idempotency stores enforce that capability immediately before
+the effect. The graph records a separate policy-decision node and uses its
+runtime `approval_required` fact to select the direct or approved path.
+
+This is important: an LLM may recommend an action, but it has no signing key,
+approval authority, KVM access, evaluator authority, or ledger-write
+permission.
+
+### 3. Untrusted execution boundary
+
+```mermaid
+flowchart LR
+    C[Unprivileged controller] -->|prepared operation only| FS[Privileged Firecracker supervisor]
+    FS -->|fresh VM, read-only rootfs| VM[Guest workload]
+    VM -->|result document| FS
+    FS -->|hashes + signed supervisor receipt| C
+    C -->|artifact manifest only| EV[Protected evaluator]
+    C -. no KVM, jailer, or guest credentials .-> VM
+    VM -. no policy keys or ledger credentials .-> C
+```
+
+The production design places untrusted code behind a separately deployed
+Firecracker supervisor. The controller supplies a capability-bound prepared
+operation; the supervisor owns KVM/jailer access, creates a fresh writable job
+drive, uses a read-only root filesystem, and returns a signed lifecycle/result
+receipt after teardown. An unknown in-flight outcome is reconciled, never
+blindly replayed.
+
+`LocalCommandExecutor`, local callbacks, and `DevelopmentCompletionFabric` are
+explicit development facilities. They are not an isolation or independence
+claim. Production construction requires external completion clients/verifiers
+and rejects metadata-only substitutes.
+
+### 4. Snapshot, evaluator, receipt, and acceptance path
+
+```mermaid
+flowchart TD
+    SR[snapshot.request] --> SM[snapshot.materialized]
+    ER[executor.result success] --> AM[artifact.manifest]
+    SM --> EV1[evaluator: check A]
+    AM --> EV1
+    SM --> EV2[evaluator: check B]
+    AM --> EV2
+    EV1 --> RC1[receipt: A]
+    EV2 --> RC2[receipt: B]
+    RC1 --> CR[criterion verifier]
+    RC2 --> CR
+    CR --> ALL{ALL guard join}
+    ALL --> AD[decision.accept completion]
+```
+
+Each protected evaluation plan is compiled into a concrete evaluator and
+receipt node before the run starts. The evaluator receives the exact graph
+digest, evaluator node ID, and reservation instance ID. `SignedReceiptVerifier`
+accepts a receipt only when the receipt’s run, intent, contract, artifact
+manifest, workspace snapshot, evaluator policy, graph digest, node ID, and
+node instance all match. A valid receipt copied from another run, graph, or
+evaluator node is rejected.
+
+Final acceptance is not a model judgment and not merely an action-level pass.
+The final verifier binds every contractual success condition to named hard
+checks. The graph’s criterion nodes require receipts for those conditions, the
+join is `ALL`, and `decision.accept` is itself an externally owned signed
+completion. Multi-step tasks preserve earlier passing evidence rather than
+letting a later unrelated inconclusive check erase it.
+
+### 5. Durable recovery and proof
+
+```mermaid
+stateDiagram-v2
+    [*] --> Ready
+    Ready --> PendingAuthorization: intent persisted
+    PendingAuthorization --> AwaitingApproval: approval required
+    AwaitingApproval --> PendingAuthorization: signed approval supplied
+    PendingAuthorization --> PendingEffect: exact operation persisted
+    PendingEffect --> Ready: signed result and verification
+    PendingEffect --> ReconciliationRequired: crash or unknown outcome
+    ReconciliationRequired --> ReconciledEffect: trusted supervisor reconciliation
+    ReconciledEffect --> Ready: result admitted once
+    Ready --> Accepted: all criteria + final verifier
+    Ready --> Stopped: budget, denial, or escalation
+```
+
+The checkpoint, graph state, and causal events are durable SQLite state. A
+certificate replays the stored trace through the same graph monitor, including
+the reservation/completion lifecycle, then verifies causal-parent closure,
+trace root, realized node IDs, terminal decision, and certificate signature.
+`WorkspaceTransition` also cryptographically covers its outer parent/output
+snapshots, operation, changed paths, manifest, and supervisor receipt, so an
+attacker cannot swap those fields around an otherwise valid inner artifact.
+
+### 6. Governed harness evolution
+
+```mermaid
+flowchart LR
+    H[Harness change proposal] --> B[Immutable baseline]
+    B --> SH[Held-out shadow evaluation]
+    SH -->|meets predefined metric and safety floor| RV[Independent reviewer]
+    RV --> PR[Promoted version]
+    PR --> MON[Monitored deployment]
+    MON -->|regression| RB[Second independent rollback reviewer]
+    RB --> B
+```
+
+`DynamicSubgraphPolicy` can admit only contract-bound, acyclic, read-only
+analysis subgraphs; it cannot introduce an authority-bearing node. Changes to
+context, retrieval, evaluator, probes, routing, memory, and repair components
+go through governed harness proposals with a baseline, held-out evidence,
+independent promotion, and protected rollback.
+
+## Security posture and limits
+
+V-Loop provides strong *control-plane* safeguards when deployed with the
+separate authorities described above. It does not turn an arbitrary model or
+host into a trusted environment by itself.
+
+| Threat or failure | Enforced mitigation | Remaining deployment assumption |
+| --- | --- | --- |
+| Model proposes a dangerous action | Closed contract, policy gate, capability, approvals, provenance validation | The server-owned contract and policy configuration are correct |
+| Controller fabricates evaluator/executor success | Reservation-bound signed completions and exclusive node roles | Completion signers and identity issuer are protected |
+| Replay/cross-run receipt reuse | Graph/contract/run/node-instance/artifact binding and nonce/TTL validation | Durable stores and clock source are reliable |
+| Crash during a side effect | Durable prepared operation and reconciliation-only recovery | Supervisor/reconciler correctly reports the real remote outcome |
+| Untrusted code escapes the controller boundary | Firecracker supervisor separation, read-only rootfs, fresh job drive | Host, Firecracker, jailer, kernel, and VM image are hardened and patched |
+| Forged or substituted evidence | Signed receipts, canonical artifacts/snapshots, hash-chained ledger, certificate replay | Trusted keys, revocation data, and remote services are operated securely |
+| Prompt injection/retrieval taint | Per-argument provenance DAG, untrusted-data propagation, deterministic policy | The provenance source labeling is complete |
+| Neural verifier says “accept” | Shadow-only diagnostics; no authority over policy, acceptance, execution, or memory | Operators do not wire advisory output into privileged paths |
+
+For a high-assurance deployment, use distinct workload identities for policy,
+approval, executor supervisor, snapshotter, each evaluator, receipt verifier,
+criterion verifier, ledger anchor, and execution-certificate signer; keep
+private keys outside the controller; use authenticated service-to-service
+transport; enforce key validity and revocation; pin VM/evaluator artifacts; and
+independently monitor durable storage, clocks, and the host/VM boundary.
 
 ## What is implemented
 
