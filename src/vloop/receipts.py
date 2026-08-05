@@ -9,17 +9,16 @@ paths; production policy requires schema v2.
 
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping
 from uuid import uuid4
 
-from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 from .canonical import canonical_json, digest
+from .native_backend import ed25519_sign, ed25519_verify
 
 
 class ReceiptRejected(PermissionError):
@@ -399,7 +398,7 @@ class ReceiptSigner:
         )
         return replace(
             unsigned,
-            signature=base64.urlsafe_b64encode(self._key.sign(unsigned.payload())).decode("ascii"),
+            signature=ed25519_sign(self._key, unsigned.payload()),
         )
 
 
@@ -485,11 +484,8 @@ class ReceiptVerifier:
         key = self._keys.get(receipt.key_id)
         if key is None:
             raise ReceiptRejected("receipt key is not trusted")
-        try:
-            signature = base64.urlsafe_b64decode(receipt.signature.encode("ascii"))
-            key.verify(signature, receipt.payload())
-        except (InvalidSignature, ValueError) as exc:
-            raise ReceiptRejected("invalid receipt signature") from exc
+        if not ed25519_verify(key, receipt.payload(), receipt.signature):
+            raise ReceiptRejected("invalid receipt signature")
 
         trust = self._trust_entries.get(receipt.key_id)
         if trust is not None:

@@ -8,7 +8,6 @@ the executor enforcement point, immediately before a side effect.
 
 from __future__ import annotations
 
-import base64
 import sqlite3
 import threading
 from datetime import UTC, datetime
@@ -16,12 +15,12 @@ from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
-from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 from .canonical import canonical_json
 from .models import ActionIntent, Capability
+from .native_backend import ed25519_sign, ed25519_verify
 
 
 class CapabilityRejected(PermissionError):
@@ -88,9 +87,7 @@ class CapabilitySigner:
             graph_digest=graph_digest,
             graph_node_id=graph_node_id,
         )
-        signature = base64.urlsafe_b64encode(self._private_key.sign(capability_payload(capability))).decode(
-            "ascii"
-        )
+        signature = ed25519_sign(self._private_key, capability_payload(capability))
         return Capability(
             capability_id=capability.capability_id,
             nonce=capability.nonce,
@@ -195,11 +192,8 @@ class CapabilityVerifier:
             raise CapabilityRejected("capability is expired or not yet valid")
         if capability.intent_digest != intent.intent_digest:
             raise CapabilityRejected("capability is not bound to this exact intent")
-        try:
-            signature = base64.urlsafe_b64decode(capability.signature.encode("ascii"))
-            self._public_key.verify(signature, capability_payload(capability))
-        except (InvalidSignature, ValueError) as exc:
-            raise CapabilityRejected("invalid capability signature") from exc
+        if not ed25519_verify(self._public_key, capability_payload(capability), capability.signature):
+            raise CapabilityRejected("invalid capability signature")
 
     def validate_and_consume(
         self,

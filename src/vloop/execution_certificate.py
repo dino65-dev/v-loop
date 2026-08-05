@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import base64
 from dataclasses import asdict, dataclass, replace
 from typing import Iterable
 
-from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 from .canonical import canonical_json, digest
+from .native_backend import ed25519_sign, ed25519_verify
 from .graph import GraphManifest
 from .graph_events import CausalEvent
 from .graph_monitor import TransitionMonitor
@@ -62,7 +61,7 @@ class ExecutionCertificateSigner:
     def issue(self, certificate: ExecutionCertificate) -> ExecutionCertificate:
         if certificate.key_id != self.key_id:
             raise ValueError("certificate key id does not match signer")
-        return replace(certificate, signature=base64.urlsafe_b64encode(self._key.sign(certificate.payload())).decode("ascii"))
+        return replace(certificate, signature=ed25519_sign(self._key, certificate.payload()))
 
 
 class ExecutionCertificateValidator:
@@ -81,10 +80,8 @@ class ExecutionCertificateValidator:
     ) -> None:
         if certificate.key_id != self.key_id:
             raise PermissionError("execution certificate key is not trusted")
-        try:
-            self._key.verify(base64.urlsafe_b64decode(certificate.signature.encode("ascii")), certificate.payload())
-        except (InvalidSignature, ValueError) as exc:
-            raise PermissionError("execution certificate signature is invalid") from exc
+        if not ed25519_verify(self._key, certificate.payload(), certificate.signature):
+            raise PermissionError("execution certificate signature is invalid")
         trace = tuple(events)
         if not trace or any(event.run_id != certificate.run_id or event.graph_digest != certificate.graph_digest for event in trace):
             raise PermissionError("certificate trace belongs to another run or graph")

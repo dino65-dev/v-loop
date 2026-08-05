@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from typing import Any
+
+from .native_backend import sha256_hex
 
 
 def _default(value: Any) -> Any:
@@ -28,4 +29,4 @@ def canonical_json(value: Any) -> str:
 
 
 def digest(value: Any) -> str:
-    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+    return sha256_hex(canonical_json(value).encode("utf-8"))

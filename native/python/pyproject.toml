@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.9"]
+build-backend = "maturin"
+
+[project]
+name = "vloop-native"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.maturin]
+manifest-path = "../../crates/vloop-native/Cargo.toml"
+module-name = "vloop_native._core"
+python-source = "."

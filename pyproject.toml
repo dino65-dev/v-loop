@@ -8,11 +8,15 @@ dependencies = ["cryptography>=42.0"]
 [project.optional-dependencies]
 model = ["openai>=1.0"]
 dev = ["pytest>=8.0", "ruff>=0.15", "bandit>=1.9", "pip-audit>=2.10"]
+rust = ["vloop-native==0.1.0; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.uv.sources]
+vloop-native = { path = "native/python", editable = true }
 
 [build-system]
 requires = ["setuptools>=68"]

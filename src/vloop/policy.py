@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import re
@@ -12,13 +11,13 @@ from uuid import uuid4
 from pathlib import Path
 import threading
 
-from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 from .authorization import CapabilitySigner, CapabilityVerifier, InMemoryNonceStore
 from .canonical import canonical_json
 from .models import ActionIntent, Capability, Effect, Provenance, TaskContract
+from .native_backend import ed25519_sign, ed25519_verify
 
 
 class PolicyDenied(PermissionError):
@@ -221,7 +220,7 @@ class ApprovalSigner:
             executor_id=unsigned.executor_id,
             issued_at=unsigned.issued_at,
             expires_at=unsigned.expires_at,
-            signature=base64.urlsafe_b64encode(self._key.sign(unsigned.payload())).decode("ascii"),
+            signature=ed25519_sign(self._key, unsigned.payload()),
         )
 
 
@@ -296,10 +295,8 @@ class ApprovalVerifier:
         key = self._keys.get(receipt.key_id)
         if key is None:
             raise ApprovalRejected("approval key is not trusted")
-        try:
-            key.verify(base64.urlsafe_b64decode(receipt.signature.encode("ascii")), receipt.payload())
-        except (InvalidSignature, ValueError) as exc:
-            raise ApprovalRejected("invalid approval signature") from exc
+        if not ed25519_verify(key, receipt.payload(), receipt.signature):
+            raise ApprovalRejected("invalid approval signature")
         if not self._consumption_store.consume(
             receipt.approval_id, intent_digest=intent.intent_digest, executor_id=executor_id
         ):

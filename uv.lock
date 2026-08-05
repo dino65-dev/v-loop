@@ -1132,6 +1132,9 @@ dev = [
 model = [
     { name = "openai" },
 ]
+rust = [
+    { name = "vloop-native", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1141,5 +1144,11 @@ requires-dist = [
     { name = "pip-audit", marker = "extra == 'dev'", specifier = ">=2.10" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15" },
+    { name = "vloop-native", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'rust'", editable = "native/python" },
 ]
-provides-extras = ["model", "dev"]
+provides-extras = ["model", "dev", "rust"]
+
+[[package]]
+name = "vloop-native"
+version = "0.1.0"
+source = { editable = "native/python" }

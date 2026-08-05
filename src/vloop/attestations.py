@@ -10,18 +10,17 @@ keys with SPIFFE/SVID-backed signers without changing the graph protocol.
 
 from __future__ import annotations
 
-import base64
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Mapping, Protocol
 from uuid import uuid4
 
-from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 from .canonical import canonical_json, digest
+from .native_backend import ed25519_sign, ed25519_verify
 
 
 class CompletionResult(StrEnum):
@@ -177,7 +176,7 @@ class CompletionSigner:
             input_artifact_digests=dict(input_artifact_digests), facts={key: str(value) for key, value in facts.items()},
             authority_refs=authority_refs, evidence_refs=evidence_refs, transparency_log_proof=transparency_log_proof,
         )
-        return replace(unsigned, signature=base64.urlsafe_b64encode(self._key.sign(unsigned.payload())).decode("ascii"))
+        return replace(unsigned, signature=ed25519_sign(self._key, unsigned.payload()))
 
 
 class CompletionVerifier:
@@ -235,10 +234,8 @@ class CompletionVerifier:
             or completion.expires_at - completion.issued_at > self.maximum_ttl
         ):
             raise PermissionError("node completion is expired or has invalid lifetime")
-        try:
-            key.verify(base64.urlsafe_b64decode(completion.signature.encode("ascii")), completion.payload())
-        except (InvalidSignature, ValueError) as exc:
-            raise PermissionError("node completion signature is invalid") from exc
+        if not ed25519_verify(key, completion.payload(), completion.signature):
+            raise PermissionError("node completion signature is invalid")
 
 
 class CompletionClient(Protocol):

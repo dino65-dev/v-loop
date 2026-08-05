@@ -380,6 +380,24 @@ cannot itself prevent a source tree from changing after it has been read.
     uv run --extra dev pytest
     uv run python -m vloop.demo
 
+### Optional Rust trusted kernel
+
+The Python package remains the stable public API. On Linux x86_64, install the
+optional `vloop-native` companion to route canonical-byte hashing and all
+Ed25519 capability, approval, receipt, artifact, completion, and certificate
+signatures through the Rust kernel:
+
+    uv sync --extra rust --extra dev
+    VLOOP_NATIVE_BACKEND=required uv run pytest
+
+`VLOOP_NATIVE_BACKEND=auto` (the default) uses Rust when present and retains
+the compatible Python implementation only when the optional extension is not
+installed. `off` forces Python for differential testing; `required` fails
+closed if the native module is unavailable or has an incompatible API version.
+The native workspace is intentionally narrow: it handles deterministic bytes
+and cryptography, while Python retains the controller, model integrations,
+service clients, Firecracker orchestration, and user-provided verifiers.
+
 The optional model planner needs a secret outside the repository:
 
     export VLOOP_API_KEY='...'

@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/vloop-core", "crates/vloop-native"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.83"
+license = "MIT"

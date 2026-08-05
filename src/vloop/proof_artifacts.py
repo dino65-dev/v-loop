@@ -9,16 +9,15 @@ deployment-owned storage.
 
 from __future__ import annotations
 
-import base64
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from typing import Mapping
 
-from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 from .canonical import canonical_json, digest
+from .native_backend import ed25519_sign, ed25519_verify
 
 
 class ArtifactType(StrEnum):
@@ -140,7 +139,7 @@ class ArtifactSigner:
     def sign(self, artifact: ProofCarryingArtifact) -> ProofCarryingArtifact:
         if artifact.signer_id != self.signer_id:
             raise ValueError("artifact signer differs from artifact identity")
-        return replace(artifact, signature=base64.urlsafe_b64encode(self._key.sign(artifact.payload())).decode("ascii"))
+        return replace(artifact, signature=ed25519_sign(self._key, artifact.payload()))
 
 
 class ArtifactVerifier:
@@ -154,7 +153,5 @@ class ArtifactVerifier:
         key = self._keys.get(artifact.signer_id)
         if key is None:
             raise PermissionError("artifact signer is not trusted")
-        try:
-            key.verify(base64.urlsafe_b64decode(artifact.signature.encode("ascii")), artifact.payload())
-        except (InvalidSignature, ValueError) as exc:
-            raise PermissionError("proof-carrying artifact signature is invalid") from exc
+        if not ed25519_verify(key, artifact.payload(), artifact.signature):
+            raise PermissionError("proof-carrying artifact signature is invalid")
