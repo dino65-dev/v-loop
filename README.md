@@ -506,6 +506,62 @@ persists verified history and final-goal evidence between iterations. It resumes
 only a safe checkpoint; a crash after the pre-effect checkpoint becomes
 `waiting` for supervisor/operator reconciliation and is never replayed.
 
+## Experimental Prime-style intelligence plane
+
+`prime-agent-integration-lab` adds an intentionally disabled experiment that
+adopts Prime-style programmable context and durable subagent sessions without
+adopting Prime's trust model. It is an advisory layer: it may return a
+`ReasoningArtifact` or `ActionProposal`, but it cannot receive a capability,
+call an executor, write memory, install a skill, alter a harness, or complete a
+goal. A graph producer must still sign any node completion, and the usual
+policy, evaluator, receipt, and final-verifier path remains unchanged.
+
+```mermaid
+flowchart LR
+    M["Untrusted model"] --> W["Restricted RLM worker"]
+    C["Content-addressed context handles"] --> W
+    W --> A["ReasoningArtifact / ActionProposal"]
+    A --> G["V-Loop graph and policy gates"]
+    G --> E["Protected executor"]
+    E --> R["Signed receipts and final verifier"]
+    W -. "no capabilities, effects, CRUD, or arbitrary Python" .-> X["Denied"]
+```
+
+`ProgrammableContextStore` imports existing `ContextPackage` entries as
+immutable `context://` handles. Search, slice, deterministic packing, and
+comparison operate only over a request's allowlist. Every derived object stores
+its input handles, transformation ID, content digest, and provenance roots; it
+inherits the least-trusted input's authority ceiling, so an untrusted web page
+cannot become trusted by being summarized.
+
+`ReasoningSessionStore` persists graph- and contract-bound sessions in SQLite.
+Child sessions have independent budgets, reserve those budgets from the parent
+recursion ceiling, cannot inherit a capability, and archive on expiry. The
+`AgentMessageStore` accepts only signed, monotonic messages whose sender and
+receiver belong to the same run, contract, graph, and realised node instances.
+There is no shared mutable worker dictionary.
+
+The included `OpenAICompatibleRLMWorker` is a deliberately restricted protocol
+adapter for development evaluation: it performs a bounded plan/read/synthesis
+exchange against one configured model endpoint and parses JSON only. It never
+executes model-produced Python or shell text. Production must keep
+`RLMNodePolicy.enabled` and `RLMWorkerPolicy.production_enabled` false until a
+Firecracker- or equivalently-isolated worker supervisor is deployed and the
+matched-budget gate passes. The in-process adapter is not a sandbox boundary.
+
+`compare_matched_budget` compares the experimental variants against baseline,
+sequential, and parallel scaling only when task/seed, token, and wall-clock
+budgets match. Promotion requires a positive success delta, no increase in
+false acceptance or memory contamination, zero added policy violations, and a
+cost reduction or material success improvement.
+
+Run the synthetic live worker smoke test only with an ephemeral secret:
+
+    VLOOP_API_KEY='...' uv run --extra model python -m vloop.prime_smoke
+
+It sends one synthetic note only and returns an advisory artifact. It does not
+create an executor, ledger, memory service, or harness registry.
+
 ## Verified memory
 
 WorkingStateStore holds only task-local L0 state. MemoryLedger owns canonical,
