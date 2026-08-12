@@ -37,6 +37,7 @@ class ReasoningSession:
     remaining_call_budget: int
     parent_session_id: str = ""
     status: str = "active"
+    root_graph_digest: str = ""
     objective_digest: str = ""
     allowed_context_handles_digest: str = ""
     parent_artifact_digest: str = ""
@@ -52,6 +53,8 @@ class ReasoningSession:
         for value in (self.contract_digest, self.graph_digest, self.model_digest, self.context_root_digest, self.state_snapshot_digest):
             if len(value) != 64:
                 raise ValueError("reasoning session bindings must be SHA-256 digests")
+        if self.root_graph_digest:
+            _require_digest(self.root_graph_digest, "reasoning session root graph")
         if self.created_at.tzinfo is None or self.expires_at.tzinfo is None or self.expires_at <= self.created_at:
             raise ValueError("reasoning session lifetime is invalid")
         if min(self.remaining_token_budget, self.remaining_call_budget) < 0:
@@ -90,6 +93,7 @@ class ChildSessionAdmission:
     """Trusted admission record supplied after a child GraphIR node was reserved."""
 
     child_node_instance_id: str
+    child_graph_digest: str
     objective: str
     allowed_context_handles: tuple[str, ...]
     context_manifest_digest: str
@@ -106,7 +110,10 @@ class ChildSessionAdmission:
             raise ValueError("child session admission needs realised graph identity, context, and budget")
         if len(self.allowed_context_handles) != len(set(self.allowed_context_handles)) or any(not value.startswith("context://") for value in self.allowed_context_handles):
             raise ValueError("child session admission handles are invalid")
-        for value, label in ((self.context_manifest_digest, "child context manifest"), (self.parent_artifact_digest, "parent artifact")):
+        for value, label in (
+            (self.child_graph_digest, "child graph"), (self.context_manifest_digest, "child context manifest"),
+            (self.parent_artifact_digest, "parent artifact"),
+        ):
             _require_digest(value, label)
 
     @property
@@ -121,10 +128,10 @@ class ChildSessionAdmission:
 class ReasoningSessionStore:
     """Server-owned persistent state; workers receive only a session reference."""
 
-    def __init__(self, database: str | Path) -> None:
+    def __init__(self, database: str | Path, *, connection: sqlite3.Connection | None = None) -> None:
         path = Path(database)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(path, isolation_level=None, timeout=5.0)
+        self._connection = connection or sqlite3.connect(path, isolation_level=None, timeout=5.0)
         self._connection.execute("PRAGMA busy_timeout=5000")
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute(
@@ -159,7 +166,7 @@ class ReasoningSessionStore:
         session = ReasoningSession(
             session_id, run_id, contract_digest, graph_digest, node_instance_id, node_instance_id,
             model_digest, context_root_digest, digest({"state": "initial", "session": session_id}),
-            created, created + ttl, token_budget, call_budget,
+            created, created + ttl, token_budget, call_budget, root_graph_digest=graph_digest,
         )
         self._insert(session, parent_session_id="", sequence=0)
         return self._persist_snapshot(session, {"status": "ready"}, previous_snapshot_digest="", last_processed_message_id="", continuation_status="ready", now=created)
@@ -176,6 +183,7 @@ class ReasoningSessionStore:
         continuation_status: str = "ready",
         ttl: timedelta = timedelta(minutes=30),
         now: datetime | None = None,
+        transaction_open: bool = False,
     ) -> tuple[ReasoningSession, tuple[ReasoningSession, ...]]:
         """Atomically charge a reasoning result, persist recovery state, and create children.
 
@@ -186,7 +194,8 @@ class ReasoningSessionStore:
             raise ValueError("reasoning admission usage or lifetime is invalid")
         if continuation_status not in {"ready", "waiting", "completed", "failed"}:
             raise ValueError("reasoning admission continuation status is invalid")
-        self._connection.execute("BEGIN IMMEDIATE")
+        if not transaction_open:
+            self._connection.execute("BEGIN IMMEDIATE")
         try:
             parent = self._get(parent_session_id, now=now, archive_expired=True)
             reserved_tokens = token_usage + sum(item.token_budget for item in children)
@@ -208,21 +217,35 @@ class ReasoningSessionStore:
                 ).fetchone()[0]
                 session_id = digest({"parent": parent.session_id, "node": admission.child_node_instance_id, "spawn_sequence": sequence})
                 child = ReasoningSession(
-                    session_id, parent.run_id, parent.contract_digest, parent.graph_digest,
+                    session_id, parent.run_id, parent.contract_digest, admission.child_graph_digest,
                     parent.node_instance_id, admission.child_node_instance_id, parent.model_digest,
                     admission.context_manifest_digest, digest({"state": "initial", "session": session_id}),
                     created, min(parent.expires_at, created + ttl), admission.token_budget, admission.call_budget,
                     parent.session_id, objective_digest=admission.objective_digest,
                     allowed_context_handles_digest=admission.allowed_context_handles_digest,
                     parent_artifact_digest=admission.parent_artifact_digest, spawn_event_id=admission.spawn_event_id,
+                    root_graph_digest=parent.root_graph_digest or parent.graph_digest,
                 )
                 self._insert(child, parent_session_id=parent.session_id, sequence=sequence)
-                child = self._persist_snapshot(child, {"objective": admission.objective}, previous_snapshot_digest="", last_processed_message_id="", continuation_status="ready", now=created)
+                child = self._persist_snapshot(
+                    child,
+                    {
+                        "objective": admission.objective,
+                        "allowed_context_handles": admission.allowed_context_handles,
+                        "parent_artifact_digest": admission.parent_artifact_digest,
+                    },
+                    previous_snapshot_digest="",
+                    last_processed_message_id="",
+                    continuation_status="ready",
+                    now=created,
+                )
                 realised_children.append(child)
-            self._connection.execute("COMMIT")
+            if not transaction_open:
+                self._connection.execute("COMMIT")
             return updated_parent, tuple(realised_children)
         except Exception:
-            self._connection.execute("ROLLBACK")
+            if not transaction_open:
+                self._connection.execute("ROLLBACK")
             raise
 
     def spawn_child(
@@ -232,7 +255,7 @@ class ReasoningSessionStore:
         """Deprecated test helper; real RLM paths must call ``admit_reasoning_step``."""
         parent = self.get(parent_session_id, now=now)
         admission = ChildSessionAdmission(
-            child_node_instance_id, "legacy child", ("context://legacy/handle",), parent.context_root_digest,
+            child_node_instance_id, parent.graph_digest, "legacy child", ("context://legacy/handle",), parent.context_root_digest,
             digest({"legacy-parent": parent.session_id}), f"legacy:{child_node_instance_id}", token_budget, call_budget,
         )
         _parent, children = self.admit_reasoning_step(parent_session_id, token_usage=0, call_usage=0, children=(admission,), ttl=ttl, now=now)
@@ -280,6 +303,62 @@ class ReasoningSessionStore:
             return updated
         except Exception:
             self._connection.execute("ROLLBACK")
+            raise
+
+    def resolve_child(
+        self,
+        child_session_id: str,
+        *,
+        completion_event_id: str,
+        artifact_digest: str,
+        transaction_open: bool = False,
+        now: datetime | None = None,
+    ) -> ReasoningSession:
+        """Persist a signed child result and make its parent resumable when joined.
+
+        This never interprets the child artifact.  The caller must first have
+        verified and recorded the graph-node completion in the same transaction.
+        """
+
+        _require_digest(artifact_digest, "child completion artifact")
+        if not completion_event_id.strip():
+            raise ValueError("child completion needs its causal event identity")
+        if not transaction_open:
+            self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            child = self._get(child_session_id, now=now, archive_expired=True)
+            if not child.parent_session_id:
+                raise SessionRejected("root reasoning sessions cannot be resolved as children")
+            created = now or datetime.now(UTC)
+            child_state = dict(self.load_snapshot(child_session_id).state)
+            child_state.update({"completion_event_id": completion_event_id, "artifact_digest": artifact_digest})
+            self._persist_snapshot(
+                child, child_state, previous_snapshot_digest=child.state_snapshot_digest,
+                last_processed_message_id=child.last_processed_message_id,
+                continuation_status="completed", now=created,
+            )
+            parent = self._get(child.parent_session_id, now=now, archive_expired=True)
+            sibling_rows = self._connection.execute(
+                "SELECT value_json FROM reasoning_sessions WHERE parent_session_id = ?", (parent.session_id,)
+            ).fetchall()
+            siblings = tuple(_decode(row[0]) for row in sibling_rows)
+            all_completed = all(
+                item.session_id == child.session_id or item.continuation_status == "completed" for item in siblings
+            )
+            if all_completed:
+                parent_state = dict(self.load_snapshot(parent.session_id).state)
+                parent_state["child_join"] = {"completed": len(siblings), "last_event_id": completion_event_id}
+                parent = self._persist_snapshot(
+                    parent, parent_state, previous_snapshot_digest=parent.state_snapshot_digest,
+                    last_processed_message_id=parent.last_processed_message_id,
+                    continuation_status="ready", now=created,
+                )
+            if not transaction_open:
+                self._connection.execute("COMMIT")
+            return parent
+        except Exception:
+            if not transaction_open:
+                self._connection.execute("ROLLBACK")
             raise
 
     def load_snapshot(self, session_id: str) -> SessionSnapshot:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from importlib.util import find_spec
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -59,13 +60,10 @@ def test_capability_round_trip_uses_backend_without_api_change() -> None:
 
 
 def test_required_mode_fails_closed_when_no_extension_is_installed(monkeypatch) -> None:
-    try:
-        import vloop_native._core  # type: ignore[import-not-found]
-    except ModuleNotFoundError:
+    if find_spec("vloop_native._core") is None:
         monkeypatch.setenv("VLOOP_NATIVE_BACKEND", "required")
         reset_native_backend_for_tests()
         with pytest.raises(NativeBackendUnavailable):
             native_status()
-    finally:
-        monkeypatch.delenv("VLOOP_NATIVE_BACKEND", raising=False)
-        reset_native_backend_for_tests()
+    monkeypatch.delenv("VLOOP_NATIVE_BACKEND", raising=False)
+    reset_native_backend_for_tests()

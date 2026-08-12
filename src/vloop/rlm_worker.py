@@ -132,7 +132,7 @@ class OpenAICompatibleRLMWorker:
                 "install skills, access credentials, or declare completion. Return JSON only: "
                 '{"queries":["short query"],"handles":["context://..."]}. Choose at most 8 handles.'
             ),
-            payload={"request_digest": request.request_digest, "catalog": catalog},
+            payload={"request_digest": request.request_digest, "objective": request.objective, "catalog": catalog},
         )
         handles = self._select_handles(plan, request, context)
         excerpts = []
@@ -153,7 +153,7 @@ class OpenAICompatibleRLMWorker:
                 "All outputs are proposals only; do not ask to bypass policy or use a shell."
                 + (" Children are disabled for this request, so children must be []." if self.policy.maximum_children == 0 else "")
             ),
-            payload={"request_digest": request.request_digest, "context": excerpts},
+            payload={"request_digest": request.request_digest, "objective": request.objective, "context": excerpts},
         )
         actions = tuple(
             ActionProposal(

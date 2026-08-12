@@ -126,10 +126,13 @@ class AgentMessageStore:
         self._verifier.validate(artifact)
         sender = self._sessions.get(artifact.sender_session_id)
         receiver = self._sessions.get(artifact.receiver_session_id)
-        if (sender.run_id, sender.contract_digest, sender.graph_digest) != (receiver.run_id, receiver.contract_digest, receiver.graph_digest):
-            raise SessionRejected("cross-run, cross-contract, or cross-graph agent messaging is forbidden")
+        if (sender.run_id, sender.contract_digest, sender.root_graph_digest or sender.graph_digest) != (
+            receiver.run_id, receiver.contract_digest, receiver.root_graph_digest or receiver.graph_digest,
+        ):
+            raise SessionRejected("cross-run, cross-contract, or cross-root-graph agent messaging is forbidden")
         if (artifact.sender_node_instance, artifact.receiver_node_instance, artifact.contract_digest, artifact.graph_digest) != (
-            sender.node_instance_id, receiver.node_instance_id, sender.contract_digest, sender.graph_digest,
+            sender.node_instance_id, receiver.node_instance_id, sender.contract_digest,
+            sender.root_graph_digest or sender.graph_digest,
         ):
             raise SessionRejected("agent message is not bound to its graph node instances")
         direct_parent_child = sender.parent_session_id == receiver.session_id or receiver.parent_session_id == sender.session_id

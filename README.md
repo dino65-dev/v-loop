@@ -548,6 +548,31 @@ match an explicit graph communication edge, and include a communication-edge
 and causal-parent-event reference. There is no shared mutable worker
 dictionary.
 
+`GraphNativeChildAdmissionProvider` is the Phase 2 bridge between an
+untrusted child proposal and a recursive worker. It admits a server-owned,
+networkless, read-only GraphIR subgraph through `DynamicSubgraphPolicy`, emits
+the child task and reservation events, and persists the bound child session in
+the *same SQLite transaction*. The persisted subgraph record is sufficient to
+reconstruct and revalidate the exact manifest after restart. A child may only
+finish through a separately authenticated `ValidatedNodeCompletion`; accepting
+that proof completes the reserved graph node, records the child result, joins
+all siblings, and makes the parent session resumable atomically. Cross-graph
+messages are constrained to the common root graph and the existing pairwise
+communication ACLs. This does not permit child graphs to grant effects,
+capabilities, memory writes, or completion authority.
+
+```mermaid
+flowchart TD
+    P["Parent RLM artifact"] --> D["Untrusted child proposal"]
+    D --> A["Atomic graph-native admission"]
+    A --> T["Child task event"]
+    A --> S["Reserved child RLM node"]
+    A --> R["Bound SQLite child session"]
+    S --> C["Signed child completion"]
+    C --> J["Sibling join and parent resume"]
+    D -. "cannot create effects or capabilities" .-> X["Denied"]
+```
+
 The included `OpenAICompatibleRLMWorker` is a deliberately restricted protocol
 adapter for development evaluation: it accepts only a deployment-registered
 HTTPS endpoint and allowlisted model, applies one shared request deadline to

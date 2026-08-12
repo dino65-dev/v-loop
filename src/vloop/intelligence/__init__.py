@@ -9,9 +9,11 @@ from ..repair import RepairController
 from ..programmable_context import ProgrammableContextStore
 from ..rlm_reasoning_node import RLMReasoningNode
 from ..reasoning_sessions import ReasoningSessionStore
+from ..recursive_subgraphs import GraphNativeChildAdmissionProvider, RecursiveChildPolicy
 
 __all__ = [
     "ContextEngine", "ContextPackage", "MemoryLedger", "MemoryService", "OpenAICompatiblePlanner",
     "ProgrammableContextStore", "ProtectedProbeRunner", "ReasoningSessionStore", "RepairController",
-    "RLMReasoningNode", "ShadowNeuralVerifier", "WorkingStateStore",
+    "GraphNativeChildAdmissionProvider", "RLMReasoningNode", "RecursiveChildPolicy", "ShadowNeuralVerifier",
+    "WorkingStateStore",
 ]

@@ -68,12 +68,16 @@ class RLMReasoningRequest:
     harness_digest: str
     session_id: str
     protocol_version: str = RLM_PROTOCOL_VERSION
+    objective: str = ""
+    causal_parent_event_id: str = ""
 
     def __post_init__(self) -> None:
         if self.protocol_version != RLM_PROTOCOL_VERSION:
             raise ValueError("RLM request protocol version is not supported")
         if not self.run_id.strip() or not self.node_instance_id.strip() or not self.session_id.strip() or not self.allowed_context_handles:
             raise ValueError("RLM request needs run, node, session, and context handles")
+        if len(self.objective) > 8_000:
+            raise ValueError("RLM request objective exceeds protocol bounds")
         if len(self.allowed_context_handles) != len(set(self.allowed_context_handles)) or any(not value.startswith("context://") for value in self.allowed_context_handles):
             raise ValueError("RLM request context handles must be unique context URIs")
         if min(self.maximum_recursive_calls, self.maximum_tokens, self.timeout_seconds) < 1:

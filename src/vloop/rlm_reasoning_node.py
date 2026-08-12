@@ -78,14 +78,21 @@ class RLMReasoningNode:
         })
         if children and self._child_admitter is None:
             raise PermissionError("child proposals require a GraphIR reservation provider")
-        admissions = () if not children else self._child_admitter.reserve_children(
-            request, parent_artifact_digest=parent_artifact_digest, proposals=children, context=context,
-        )
-        self._validate_admissions(children, admissions, parent_artifact_digest, context)
-        _updated, realised_children = self._sessions.admit_reasoning_step(
-            session.session_id, token_usage=output.token_usage, call_usage=output.model_calls,
-            children=admissions, state={"program_digest": digest(dict(output.program)), "summary": output.final_summary},
-        )
+        atomic_admitter = getattr(self._child_admitter, "admit_step", None)
+        if children and callable(atomic_admitter):
+            realised_children = atomic_admitter(
+                request=request, parent_session=session, parent_artifact_digest=parent_artifact_digest,
+                output=output, proposals=children, context=context,
+            )
+        else:
+            admissions = () if not children else self._child_admitter.reserve_children(
+                request, parent_artifact_digest=parent_artifact_digest, proposals=children, context=context,
+            )
+            self._validate_admissions(children, admissions, parent_artifact_digest, context)
+            _updated, realised_children = self._sessions.admit_reasoning_step(
+                session.session_id, token_usage=output.token_usage, call_usage=output.model_calls,
+                children=admissions, state={"program_digest": digest(dict(output.program)), "summary": output.final_summary},
+            )
         ceilings = [context.read(handle, allowed_handles=request.allowed_context_handles).authority_ceiling for handle in output.context_reads]
         authority = min(ceilings, default=ContextAuthority.UNTRUSTED)
         return ReasoningArtifact(
