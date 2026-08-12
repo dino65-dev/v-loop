@@ -535,16 +535,27 @@ inherits the least-trusted input's authority ceiling, so an untrusted web page
 cannot become trusted by being summarized.
 
 `ReasoningSessionStore` persists graph- and contract-bound sessions in SQLite.
-Child sessions have independent budgets, reserve those budgets from the parent
-recursion ceiling, cannot inherit a capability, and archive on expiry. The
-`AgentMessageStore` accepts only signed, monotonic messages whose sender and
-receiver belong to the same run, contract, graph, and realised node instances.
-There is no shared mutable worker dictionary.
+Its `admit_reasoning_step` transaction charges measured parent usage, persists
+a hash-chained recoverable state blob, and creates all admitted children or
+none of them. A child must arrive with a reserved GraphIR node-instance ID,
+start-event reference, exact objective, exact restricted context manifest, and
+parent-artifact digest; the session store never invents node identities. Child
+sessions have independent budgets, reserve those budgets from the parent
+recursion ceiling, cannot inherit a capability, and archive on expiry.
+`AgentMessageStore` accepts only signed messages with pairwise *and*
+receiver-wide monotonic sequences. Messages must be direct parent/child or
+match an explicit graph communication edge, and include a communication-edge
+and causal-parent-event reference. There is no shared mutable worker
+dictionary.
 
 The included `OpenAICompatibleRLMWorker` is a deliberately restricted protocol
-adapter for development evaluation: it performs a bounded plan/read/synthesis
-exchange against one configured model endpoint and parses JSON only. It never
-executes model-produced Python or shell text. Production must keep
+adapter for development evaluation: it accepts only a deployment-registered
+HTTPS endpoint and allowlisted model, applies one shared request deadline to
+the plan/read/synthesis exchange, caps completion tokens, and records a
+`ModelUsageReceipt` for every call. Missing provider usage is rejected by
+default. Its parser uses a closed JSON protocol with bounded text, collection,
+numeric, and argument-depth limits; it never executes model-produced Python or
+shell text. Production must keep
 `RLMNodePolicy.enabled` and `RLMWorkerPolicy.production_enabled` false until a
 Firecracker- or equivalently-isolated worker supervisor is deployed and the
 matched-budget gate passes. The in-process adapter is not a sandbox boundary.

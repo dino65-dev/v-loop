@@ -11,6 +11,11 @@ from pathlib import Path
 from .canonical import digest
 
 
+def _require_digest(value: str, label: str) -> None:
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError(f"{label} must be a SHA-256 digest")
+
+
 class SessionRejected(PermissionError):
     """A session crossed a graph, contract, budget, or expiry boundary."""
 
@@ -32,10 +37,17 @@ class ReasoningSession:
     remaining_call_budget: int
     parent_session_id: str = ""
     status: str = "active"
+    objective_digest: str = ""
+    allowed_context_handles_digest: str = ""
+    parent_artifact_digest: str = ""
+    spawn_event_id: str = ""
+    state_blob_ref: str = ""
+    last_processed_message_id: str = ""
+    continuation_status: str = "ready"
 
     def __post_init__(self) -> None:
         required = (self.session_id, self.run_id, self.parent_node_instance_id, self.node_instance_id)
-        if not all(required) or self.status not in {"active", "archived"}:
+        if not all(required) or self.status not in {"active", "archived"} or self.continuation_status not in {"ready", "waiting", "completed", "failed"}:
             raise ValueError("reasoning sessions need identity and a closed status")
         for value in (self.contract_digest, self.graph_digest, self.model_digest, self.context_root_digest, self.state_snapshot_digest):
             if len(value) != 64:
@@ -44,6 +56,66 @@ class ReasoningSession:
             raise ValueError("reasoning session lifetime is invalid")
         if min(self.remaining_token_budget, self.remaining_call_budget) < 0:
             raise ValueError("reasoning session budget is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSnapshot:
+    snapshot_digest: str
+    session_id: str
+    state: dict[str, object]
+    previous_snapshot_digest: str
+    last_processed_message_id: str
+    continuation_status: str
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        if not self.session_id or self.continuation_status not in {"ready", "waiting", "completed", "failed"}:
+            raise ValueError("session snapshot is invalid")
+        if self.created_at.tzinfo is None:
+            raise ValueError("session snapshots require timezone-aware timestamps")
+        if self.previous_snapshot_digest:
+            _require_digest(self.previous_snapshot_digest, "previous snapshot")
+        expected = digest({
+            "session_id": self.session_id, "state": self.state,
+            "previous_snapshot_digest": self.previous_snapshot_digest,
+            "last_processed_message_id": self.last_processed_message_id,
+            "continuation_status": self.continuation_status,
+        })
+        if self.snapshot_digest != expected:
+            raise ValueError("session snapshot digest does not match its recoverable state")
+
+
+@dataclass(frozen=True, slots=True)
+class ChildSessionAdmission:
+    """Trusted admission record supplied after a child GraphIR node was reserved."""
+
+    child_node_instance_id: str
+    objective: str
+    allowed_context_handles: tuple[str, ...]
+    context_manifest_digest: str
+    parent_artifact_digest: str
+    spawn_event_id: str
+    token_budget: int
+    call_budget: int
+
+    def __post_init__(self) -> None:
+        if (
+            not self.child_node_instance_id or not self.objective.strip() or not self.allowed_context_handles
+            or not self.spawn_event_id or min(self.token_budget, self.call_budget) < 1
+        ):
+            raise ValueError("child session admission needs realised graph identity, context, and budget")
+        if len(self.allowed_context_handles) != len(set(self.allowed_context_handles)) or any(not value.startswith("context://") for value in self.allowed_context_handles):
+            raise ValueError("child session admission handles are invalid")
+        for value, label in ((self.context_manifest_digest, "child context manifest"), (self.parent_artifact_digest, "parent artifact")):
+            _require_digest(value, label)
+
+    @property
+    def objective_digest(self) -> str:
+        return digest(self.objective)
+
+    @property
+    def allowed_context_handles_digest(self) -> str:
+        return digest(self.allowed_context_handles)
 
 
 class ReasoningSessionStore:
@@ -59,6 +131,19 @@ class ReasoningSessionStore:
             """CREATE TABLE IF NOT EXISTS reasoning_sessions (
                 session_id TEXT PRIMARY KEY, value_json TEXT NOT NULL,
                 parent_session_id TEXT NOT NULL, spawn_sequence INTEGER NOT NULL
+            )"""
+        )
+        self._connection.execute(
+            """CREATE TABLE IF NOT EXISTS reasoning_session_snapshots (
+                snapshot_digest TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                state_json TEXT NOT NULL, previous_snapshot_digest TEXT NOT NULL,
+                last_processed_message_id TEXT NOT NULL, continuation_status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        self._connection.execute(
+            """CREATE TABLE IF NOT EXISTS reasoning_session_nodes (
+                node_instance_id TEXT PRIMARY KEY, session_id TEXT NOT NULL UNIQUE
             )"""
         )
 
@@ -77,37 +162,81 @@ class ReasoningSessionStore:
             created, created + ttl, token_budget, call_budget,
         )
         self._insert(session, parent_session_id="", sequence=0)
-        return session
+        return self._persist_snapshot(session, {"status": "ready"}, previous_snapshot_digest="", last_processed_message_id="", continuation_status="ready", now=created)
+
+    def admit_reasoning_step(
+        self,
+        parent_session_id: str,
+        *,
+        token_usage: int,
+        call_usage: int,
+        children: tuple[ChildSessionAdmission, ...] = (),
+        state: dict[str, object] | None = None,
+        last_processed_message_id: str = "",
+        continuation_status: str = "ready",
+        ttl: timedelta = timedelta(minutes=30),
+        now: datetime | None = None,
+    ) -> tuple[ReasoningSession, tuple[ReasoningSession, ...]]:
+        """Atomically charge a reasoning result, persist recovery state, and create children.
+
+        The caller must provide GraphIR-reserved node/event identities in each
+        admission; this store never manufactures node identities itself.
+        """
+        if token_usage < 0 or call_usage < 0 or ttl <= timedelta(0):
+            raise ValueError("reasoning admission usage or lifetime is invalid")
+        if continuation_status not in {"ready", "waiting", "completed", "failed"}:
+            raise ValueError("reasoning admission continuation status is invalid")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            parent = self._get(parent_session_id, now=now, archive_expired=True)
+            reserved_tokens = token_usage + sum(item.token_budget for item in children)
+            reserved_calls = call_usage + sum(item.call_budget for item in children)
+            if parent.remaining_token_budget < reserved_tokens or parent.remaining_call_budget < reserved_calls:
+                raise SessionRejected("parent recursive budget is exhausted")
+            created = now or datetime.now(UTC)
+            updated_parent = self._update(parent, tokens=reserved_tokens, calls=reserved_calls)
+            updated_parent = self._persist_snapshot(
+                updated_parent, state or {"status": continuation_status}, previous_snapshot_digest=parent.state_snapshot_digest,
+                last_processed_message_id=last_processed_message_id, continuation_status=continuation_status, now=created,
+            )
+            realised_children: list[ReasoningSession] = []
+            for admission in children:
+                if self._connection.execute("SELECT 1 FROM reasoning_session_nodes WHERE node_instance_id = ?", (admission.child_node_instance_id,)).fetchone():
+                    raise SessionRejected("child graph node instance was already admitted")
+                sequence = self._connection.execute(
+                    "SELECT COALESCE(MAX(spawn_sequence), 0) + 1 FROM reasoning_sessions WHERE parent_session_id = ?", (parent_session_id,)
+                ).fetchone()[0]
+                session_id = digest({"parent": parent.session_id, "node": admission.child_node_instance_id, "spawn_sequence": sequence})
+                child = ReasoningSession(
+                    session_id, parent.run_id, parent.contract_digest, parent.graph_digest,
+                    parent.node_instance_id, admission.child_node_instance_id, parent.model_digest,
+                    admission.context_manifest_digest, digest({"state": "initial", "session": session_id}),
+                    created, min(parent.expires_at, created + ttl), admission.token_budget, admission.call_budget,
+                    parent.session_id, objective_digest=admission.objective_digest,
+                    allowed_context_handles_digest=admission.allowed_context_handles_digest,
+                    parent_artifact_digest=admission.parent_artifact_digest, spawn_event_id=admission.spawn_event_id,
+                )
+                self._insert(child, parent_session_id=parent.session_id, sequence=sequence)
+                child = self._persist_snapshot(child, {"objective": admission.objective}, previous_snapshot_digest="", last_processed_message_id="", continuation_status="ready", now=created)
+                realised_children.append(child)
+            self._connection.execute("COMMIT")
+            return updated_parent, tuple(realised_children)
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
 
     def spawn_child(
         self, parent_session_id: str, *, child_node_instance_id: str, token_budget: int,
         call_budget: int, ttl: timedelta = timedelta(minutes=30), now: datetime | None = None,
     ) -> ReasoningSession:
-        if min(token_budget, call_budget) < 1 or ttl <= timedelta(0):
-            raise ValueError("child session needs positive budgets and lifetime")
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
-            parent = self._get(parent_session_id, now=now, archive_expired=True)
-            if parent.remaining_token_budget < token_budget or parent.remaining_call_budget < call_budget:
-                raise SessionRejected("parent recursive budget is exhausted")
-            sequence = self._connection.execute(
-                "SELECT COALESCE(MAX(spawn_sequence), 0) + 1 FROM reasoning_sessions WHERE parent_session_id = ?", (parent_session_id,)
-            ).fetchone()[0]
-            created = now or datetime.now(UTC)
-            session_id = digest({"parent": parent.session_id, "node": child_node_instance_id, "spawn_sequence": sequence})
-            child = ReasoningSession(
-                session_id, parent.run_id, parent.contract_digest, parent.graph_digest,
-                parent.node_instance_id, child_node_instance_id, parent.model_digest,
-                parent.context_root_digest, digest({"state": "initial", "session": session_id}),
-                created, min(parent.expires_at, created + ttl), token_budget, call_budget, parent.session_id,
-            )
-            self._update(parent, tokens=token_budget, calls=call_budget)
-            self._insert(child, parent_session_id=parent.session_id, sequence=sequence)
-            self._connection.execute("COMMIT")
-            return child
-        except Exception:
-            self._connection.execute("ROLLBACK")
-            raise
+        """Deprecated test helper; real RLM paths must call ``admit_reasoning_step``."""
+        parent = self.get(parent_session_id, now=now)
+        admission = ChildSessionAdmission(
+            child_node_instance_id, "legacy child", ("context://legacy/handle",), parent.context_root_digest,
+            digest({"legacy-parent": parent.session_id}), f"legacy:{child_node_instance_id}", token_budget, call_budget,
+        )
+        _parent, children = self.admit_reasoning_step(parent_session_id, token_usage=0, call_usage=0, children=(admission,), ttl=ttl, now=now)
+        return children[0]
 
     def get(self, session_id: str, *, now: datetime | None = None) -> ReasoningSession:
         return self._get(session_id, now=now, archive_expired=True)
@@ -142,13 +271,28 @@ class ReasoningSessionStore:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             value = self._get(session_id, now=now, archive_expired=True)
-            updated = replace(value, state_snapshot_digest=digest(state))
-            self._replace(updated)
+            updated = self._persist_snapshot(
+                value, state, previous_snapshot_digest=value.state_snapshot_digest,
+                last_processed_message_id=value.last_processed_message_id,
+                continuation_status=value.continuation_status, now=now or datetime.now(UTC),
+            )
             self._connection.execute("COMMIT")
             return updated
         except Exception:
             self._connection.execute("ROLLBACK")
             raise
+
+    def load_snapshot(self, session_id: str) -> SessionSnapshot:
+        session = self.get(session_id)
+        row = self._connection.execute(
+            "SELECT snapshot_digest, session_id, state_json, previous_snapshot_digest, last_processed_message_id, continuation_status, created_at "
+            "FROM reasoning_session_snapshots WHERE snapshot_digest = ?", (session.state_snapshot_digest,)
+        ).fetchone()
+        if row is None:
+            raise SessionRejected("reasoning session snapshot is unavailable for recovery")
+        return SessionSnapshot(
+            row[0], row[1], json.loads(row[2]), row[3], row[4], row[5], datetime.fromisoformat(row[6]),
+        )
 
     def _get(self, session_id: str, *, now: datetime | None, archive_expired: bool) -> ReasoningSession:
         row = self._connection.execute("SELECT value_json FROM reasoning_sessions WHERE session_id = ?", (session_id,)).fetchone()
@@ -169,6 +313,9 @@ class ReasoningSessionStore:
             "INSERT INTO reasoning_sessions VALUES (?, ?, ?, ?)",
             (value.session_id, json.dumps(_encode(value), sort_keys=True), parent_session_id, sequence),
         )
+        self._connection.execute(
+            "INSERT INTO reasoning_session_nodes VALUES (?, ?)", (value.node_instance_id, value.session_id)
+        )
 
     def _replace(self, value: ReasoningSession) -> None:
         self._connection.execute("UPDATE reasoning_sessions SET value_json = ? WHERE session_id = ?", (json.dumps(_encode(value), sort_keys=True), value.session_id))
@@ -178,6 +325,41 @@ class ReasoningSessionStore:
             value,
             remaining_token_budget=value.remaining_token_budget - tokens,
             remaining_call_budget=value.remaining_call_budget - calls,
+        )
+        self._replace(updated)
+        return updated
+
+    def _persist_snapshot(
+        self,
+        value: ReasoningSession,
+        state: dict[str, object],
+        *,
+        previous_snapshot_digest: str,
+        last_processed_message_id: str,
+        continuation_status: str,
+        now: datetime,
+    ) -> ReasoningSession:
+        snapshot_digest = digest({
+            "session_id": value.session_id, "state": state,
+            "previous_snapshot_digest": previous_snapshot_digest,
+            "last_processed_message_id": last_processed_message_id,
+            "continuation_status": continuation_status,
+        })
+        snapshot = SessionSnapshot(
+            snapshot_digest, value.session_id, state, previous_snapshot_digest,
+            last_processed_message_id, continuation_status, now,
+        )
+        self._connection.execute(
+            "INSERT INTO reasoning_session_snapshots VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                snapshot.snapshot_digest, snapshot.session_id, json.dumps(snapshot.state, sort_keys=True),
+                snapshot.previous_snapshot_digest, snapshot.last_processed_message_id,
+                snapshot.continuation_status, snapshot.created_at.isoformat(),
+            ),
+        )
+        updated = replace(
+            value, state_snapshot_digest=snapshot.snapshot_digest, state_blob_ref=snapshot.snapshot_digest,
+            last_processed_message_id=last_processed_message_id, continuation_status=continuation_status,
         )
         self._replace(updated)
         return updated
