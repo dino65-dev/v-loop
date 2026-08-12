@@ -506,6 +506,98 @@ persists verified history and final-goal evidence between iterations. It resumes
 only a safe checkpoint; a crash after the pre-effect checkpoint becomes
 `waiting` for supervisor/operator reconciliation and is never replayed.
 
+## Experimental Prime-style intelligence plane
+
+`prime-agent-integration-lab` adds an intentionally disabled experiment that
+adopts Prime-style programmable context and durable subagent sessions without
+adopting Prime's trust model. It is an advisory layer: it may return a
+`ReasoningArtifact` or `ActionProposal`, but it cannot receive a capability,
+call an executor, write memory, install a skill, alter a harness, or complete a
+goal. A graph producer must still sign any node completion, and the usual
+policy, evaluator, receipt, and final-verifier path remains unchanged.
+
+```mermaid
+flowchart LR
+    M["Untrusted model"] --> W["Restricted RLM worker"]
+    C["Content-addressed context handles"] --> W
+    W --> A["ReasoningArtifact / ActionProposal"]
+    A --> G["V-Loop graph and policy gates"]
+    G --> E["Protected executor"]
+    E --> R["Signed receipts and final verifier"]
+    W -. "no capabilities, effects, CRUD, or arbitrary Python" .-> X["Denied"]
+```
+
+`ProgrammableContextStore` imports existing `ContextPackage` entries as
+immutable `context://` handles. Search, slice, deterministic packing, and
+comparison operate only over a request's allowlist. Every derived object stores
+its input handles, transformation ID, content digest, and provenance roots; it
+inherits the least-trusted input's authority ceiling, so an untrusted web page
+cannot become trusted by being summarized.
+
+`ReasoningSessionStore` persists graph- and contract-bound sessions in SQLite.
+Its `admit_reasoning_step` transaction charges measured parent usage, persists
+a hash-chained recoverable state blob, and creates all admitted children or
+none of them. A child must arrive with a reserved GraphIR node-instance ID,
+start-event reference, exact objective, exact restricted context manifest, and
+parent-artifact digest; the session store never invents node identities. Child
+sessions have independent budgets, reserve those budgets from the parent
+recursion ceiling, cannot inherit a capability, and archive on expiry.
+`AgentMessageStore` accepts only signed messages with pairwise *and*
+receiver-wide monotonic sequences. Messages must be direct parent/child or
+match an explicit graph communication edge, and include a communication-edge
+and causal-parent-event reference. There is no shared mutable worker
+dictionary.
+
+`GraphNativeChildAdmissionProvider` is the Phase 2 bridge between an
+untrusted child proposal and a recursive worker. It admits a server-owned,
+networkless, read-only GraphIR subgraph through `DynamicSubgraphPolicy`, emits
+the child task and reservation events, and persists the bound child session in
+the *same SQLite transaction*. The persisted subgraph record is sufficient to
+reconstruct and revalidate the exact manifest after restart. A child may only
+finish through a separately authenticated `ValidatedNodeCompletion`; accepting
+that proof completes the reserved graph node, records the child result, joins
+all siblings, and makes the parent session resumable atomically. Cross-graph
+messages are constrained to the common root graph and the existing pairwise
+communication ACLs. This does not permit child graphs to grant effects,
+capabilities, memory writes, or completion authority.
+
+```mermaid
+flowchart TD
+    P["Parent RLM artifact"] --> D["Untrusted child proposal"]
+    D --> A["Atomic graph-native admission"]
+    A --> T["Child task event"]
+    A --> S["Reserved child RLM node"]
+    A --> R["Bound SQLite child session"]
+    S --> C["Signed child completion"]
+    C --> J["Sibling join and parent resume"]
+    D -. "cannot create effects or capabilities" .-> X["Denied"]
+```
+
+The included `OpenAICompatibleRLMWorker` is a deliberately restricted protocol
+adapter for development evaluation: it accepts only a deployment-registered
+HTTPS endpoint and allowlisted model, applies one shared request deadline to
+the plan/read/synthesis exchange, caps completion tokens, and records a
+`ModelUsageReceipt` for every call. Missing provider usage is rejected by
+default. Its parser uses a closed JSON protocol with bounded text, collection,
+numeric, and argument-depth limits; it never executes model-produced Python or
+shell text. Production must keep
+`RLMNodePolicy.enabled` and `RLMWorkerPolicy.production_enabled` false until a
+Firecracker- or equivalently-isolated worker supervisor is deployed and the
+matched-budget gate passes. The in-process adapter is not a sandbox boundary.
+
+`compare_matched_budget` compares the experimental variants against baseline,
+sequential, and parallel scaling only when task/seed, token, and wall-clock
+budgets match. Promotion requires a positive success delta, no increase in
+false acceptance or memory contamination, zero added policy violations, and a
+cost reduction or material success improvement.
+
+Run the synthetic live worker smoke test only with an ephemeral secret:
+
+    VLOOP_API_KEY='...' uv run --extra model python -m vloop.prime_smoke
+
+It sends one synthetic note only and returns an advisory artifact. It does not
+create an executor, ledger, memory service, or harness registry.
+
 ## Verified memory
 
 WorkingStateStore holds only task-local L0 state. MemoryLedger owns canonical,
