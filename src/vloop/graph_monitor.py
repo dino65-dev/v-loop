@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from .graph import GraphEdge, GraphEdgeType, GraphManifest
+from .graph import GraphEdge, GraphManifest
 from .graph_schema import GraphJoin
 
 

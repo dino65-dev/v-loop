@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -146,6 +145,7 @@ class DurableGraphScheduler:
         authorization_ref: str = "",
         receipt_refs: tuple[str, ...] = (),
         completion: ValidatedNodeCompletion | None = None,
+        transaction_open: bool = False,
     ) -> ScheduledTransition:
         if not run_id.strip() or iteration < 1:
             raise ValueError("scheduled transitions need a run and positive iteration")
@@ -167,8 +167,10 @@ class DurableGraphScheduler:
                 output_artifacts=output_artifacts,
                 authorization_ref=authorization_ref,
                 receipt_refs=receipt_refs,
+                transaction_open=transaction_open,
             )
-        self._connection.execute("BEGIN IMMEDIATE")
+        if not transaction_open:
+            self._connection.execute("BEGIN IMMEDIATE")
         try:
             state = self.state(run_id=run_id, iteration=iteration)
             next_state = self.monitor.advance(state, template_node_id, payload)
@@ -199,9 +201,11 @@ class DurableGraphScheduler:
             )
             self.event_store.append(event, commit=False)
             self._save(run_id, next_state, attempts)
-            self._connection.execute("COMMIT")
+            if not transaction_open:
+                self._connection.execute("COMMIT")
         except Exception:
-            self._connection.execute("ROLLBACK")
+            if not transaction_open:
+                self._connection.execute("ROLLBACK")
             raise
         return ScheduledTransition(event, next_state)
 
@@ -214,12 +218,14 @@ class DurableGraphScheduler:
         event_type: str = "node.started",
         payload: Mapping[str, Any] = {},
         causal_parents: tuple[str, ...] = (),
+        transaction_open: bool = False,
     ) -> ScheduledReservation:
         """Reserve an enabled external node before asking its producer to act."""
 
         if not run_id.strip() or iteration < 1:
             raise ValueError("scheduled reservations need a run and positive iteration")
-        self._connection.execute("BEGIN IMMEDIATE")
+        if not transaction_open:
+            self._connection.execute("BEGIN IMMEDIATE")
         try:
             state = self.state(run_id=run_id, iteration=iteration)
             next_state = self.monitor.reserve(state, template_node_id, payload)
@@ -238,9 +244,11 @@ class DurableGraphScheduler:
             )
             self.event_store.append(event, commit=False)
             self._save(run_id, next_state, attempts)
-            self._connection.execute("COMMIT")
+            if not transaction_open:
+                self._connection.execute("COMMIT")
         except Exception:
-            self._connection.execute("ROLLBACK")
+            if not transaction_open:
+                self._connection.execute("ROLLBACK")
             raise
         return ScheduledReservation(event, instance, next_state)
 
@@ -253,6 +261,7 @@ class DurableGraphScheduler:
         completion: ValidatedNodeCompletion,
         event_type: str = "node.completed",
         causal_parents: tuple[str, ...] = (),
+        transaction_open: bool = False,
     ) -> ScheduledTransition:
         """Accept only a producer-authenticated completion for a reservation."""
 
@@ -263,6 +272,7 @@ class DurableGraphScheduler:
             output_artifacts={"primary": completion.artifact_digest},
             authorization_ref=completion.authority_refs[0] if completion.authority_refs else "",
             receipt_refs=completion.evidence_refs,
+            transaction_open=transaction_open,
         )
 
     def _complete_direct(
@@ -279,10 +289,12 @@ class DurableGraphScheduler:
         output_artifacts: Mapping[str, str],
         authorization_ref: str,
         receipt_refs: tuple[str, ...],
+        transaction_open: bool = False,
     ) -> ScheduledTransition:
         if self.completion_verifier is None:
             raise PermissionError("validated completions require a configured ownership verifier")
-        self._connection.execute("BEGIN IMMEDIATE")
+        if not transaction_open:
+            self._connection.execute("BEGIN IMMEDIATE")
         try:
             state = self.state(run_id=run_id, iteration=iteration)
             started = state.started.get(template_node_id)
@@ -325,9 +337,11 @@ class DurableGraphScheduler:
             )
             self.event_store.append(event, commit=False)
             self._save(run_id, next_state, self._attempts(run_id, iteration))
-            self._connection.execute("COMMIT")
+            if not transaction_open:
+                self._connection.execute("COMMIT")
         except Exception:
-            self._connection.execute("ROLLBACK")
+            if not transaction_open:
+                self._connection.execute("ROLLBACK")
             raise
         return ScheduledTransition(event, next_state)
 
