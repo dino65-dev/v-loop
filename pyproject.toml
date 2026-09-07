@@ -3,7 +3,7 @@ name = "vloop"
 version = "0.1.0"
 description = "Verified Adaptive Loop Agent: deterministic V0"
 requires-python = ">=3.11"
-dependencies = ["cryptography>=42.0"]
+dependencies = ["cryptography>=50.0.0"]
 
 [project.optional-dependencies]
 model = ["openai>=1.0"]
